@@ -329,6 +329,7 @@ type Options struct {
 	Host            string `json:"addr"`
 	Port            int    `json:"port"`
 	DontListen      bool   `json:"dont_listen"`
+	UDSPath         string `json:"uds_path"`
 	ClientAdvertise string `json:"-"`
 	Trace           bool   `json:"-"`
 	Debug           bool   `json:"-"`
@@ -1071,6 +1072,8 @@ func (o *Options) processConfigFileLine(k string, v any, errors *[]error, warnin
 		o.ServerName = sn
 	case "host", "net":
 		o.Host = v.(string)
+	case "uds_path":
+		o.UDSPath = v.(string)
 	case "debug":
 		o.Debug = v.(bool)
 		trackExplicitVal(&o.inConfig, "Debug", o.Debug)
@@ -6041,6 +6044,8 @@ func ConfigureOptions(fs *flag.FlagSet, args []string, printVersion, printHelp, 
 	fs.StringVar(&opts.Host, "addr", _EMPTY_, "Network host to listen on.")
 	fs.StringVar(&opts.Host, "a", _EMPTY_, "Network host to listen on.")
 	fs.StringVar(&opts.Host, "net", _EMPTY_, "Network host to listen on.")
+	fs.StringVar(&opts.UDSPath, "uds_path", _EMPTY_, "UNIX domain socket path to listen on (Linux only).")
+	fs.BoolVar(&opts.DontListen, "dont_listen_tcp", false, "Do not listen on host/port via TCP.")
 	fs.StringVar(&opts.ClientAdvertise, "client_advertise", _EMPTY_, "Client URL to advertise to other servers.")
 	fs.BoolVar(&opts.Debug, "D", false, "Enable Debug logging.")
 	fs.BoolVar(&opts.Debug, "debug", false, "Enable Debug logging.")

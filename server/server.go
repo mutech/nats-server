@@ -115,6 +115,7 @@ type Info struct {
 	GoVersion         string   `json:"go"`
 	Host              string   `json:"host"`
 	Port              int      `json:"port"`
+	UDSPath           string   `json:"uds_path,omitempty"`
 	Headers           bool     `json:"headers"`
 	AuthRequired      bool     `json:"auth_required,omitempty"`
 	TLSRequired       bool     `json:"tls_required,omitempty"`
@@ -187,6 +188,9 @@ type Server struct {
 	shutdown            atomic.Bool
 	listener            net.Listener
 	listenerErr         error
+	udsListener         net.Listener
+	udsListenerErr      error
+	udsPeerCredQueries  map[string]PeerCredQueryFunc
 	gacc                *Account
 	sys                 *internal
 	sysAcc              atomic.Pointer[Account]
@@ -2568,6 +2572,9 @@ func (s *Server) Start() {
 	// Wait for clients.
 	if !opts.DontListen {
 		s.AcceptLoop(clientListenReady)
+		s.UDSAcceptLoop(nil)
+	} else {
+		s.UDSAcceptLoop(clientListenReady)
 	}
 
 	// Bring OSCP Response cache online after accept loop started in anticipation of NATS-enabled cache types
@@ -2662,6 +2669,13 @@ func (s *Server) Shutdown() {
 		doneExpected++
 		s.listener.Close()
 		s.listener = nil
+	}
+
+	// Kick UDS client AcceptLoop()
+	if s.udsListener != nil {
+		doneExpected++
+		s.udsListener.Close()
+		s.udsListener = nil
 	}
 
 	// Kick websocket server
@@ -3972,6 +3986,7 @@ func (s *Server) readyForConnections(d time.Duration) error {
 		chk["leafnode"] = info{ok: (opts.LeafNode.Port == 0 || s.leafNodeListener != nil), err: s.leafNodeListenerErr}
 		chk["websocket"] = info{ok: (opts.Websocket.Port == 0 || s.websocket.listener != nil), err: s.websocket.listenerErr}
 		chk["mqtt"] = info{ok: (opts.MQTT.Port == 0 || s.mqtt.listener != nil), err: s.mqtt.listenerErr}
+		chk["uds"] = info{ok: (opts.UDSPath == _EMPTY_ || s.udsListener != nil), err: s.udsListenerErr}
 		s.mu.RUnlock()
 
 		var numOK int
