@@ -17,6 +17,7 @@ package server
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -159,30 +160,34 @@ func (s *Server) UDSAcceptLoop(clr chan struct{}) {
 	clr = nil
 }
 
-// peerCredQueryUIDName matches UID against a username lookup.
+// peerCredQueryUIDName looks up peer's UID and compares username with value.
+// Returns true if username equals value. If UID has no passwd entry, username is empty.
 func peerCredQueryUIDName(c UDSPeerCreds, v string) (bool, error) {
-	u, err := user.Lookup(v)
+	u, err := user.LookupId(strconv.Itoa(c.UID))
 	if err != nil {
-		return false, fmt.Errorf("user lookup %q: %w", v, err)
+		var unknownUID user.UnknownUserIdError
+		if errors.As(err, &unknownUID) {
+			// No passwd entry for this UID - treat as empty username
+			return v == "", nil
+		}
+		return false, fmt.Errorf("user lookup for uid %d: %w", c.UID, err)
 	}
-	uid, err := strconv.Atoi(u.Uid)
-	if err != nil {
-		return false, fmt.Errorf("invalid uid from lookup %q: %w", u.Uid, err)
-	}
-	return c.UID == uid, nil
+	return u.Username == v, nil
 }
 
-// peerCredQueryGIDName matches GID against a group name lookup.
+// peerCredQueryGIDName looks up peer's GID and compares group name with value.
+// Returns true if group name equals value. If GID has no group entry, name is empty.
 func peerCredQueryGIDName(c UDSPeerCreds, v string) (bool, error) {
-	g, err := user.LookupGroup(v)
+	g, err := user.LookupGroupId(strconv.Itoa(c.GID))
 	if err != nil {
-		return false, fmt.Errorf("group lookup %q: %w", v, err)
+		var unknownGID user.UnknownGroupIdError
+		if errors.As(err, &unknownGID) {
+			// No group entry for this GID - treat as empty name
+			return v == "", nil
+		}
+		return false, fmt.Errorf("group lookup for gid %d: %w", c.GID, err)
 	}
-	gid, err := strconv.Atoi(g.Gid)
-	if err != nil {
-		return false, fmt.Errorf("invalid gid from lookup %q: %w", g.Gid, err)
-	}
-	return c.GID == gid, nil
+	return g.Name == v, nil
 }
 
 // getProcessSupplementalGroups reads supplemental groups from /proc/<pid>/status.

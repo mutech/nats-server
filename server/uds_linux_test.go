@@ -44,7 +44,7 @@ func TestUDSAuth_QueryUIDName(t *testing.T) {
 		t.Errorf("expected match for current user %q", currentUser.Username)
 	}
 
-	// No match for different UID
+	// No match for different UID (non-existent UID returns empty username)
 	match, err = peerCredQueryUIDName(UDSPeerCreds{UID: uid + 99999}, currentUser.Username)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -53,10 +53,22 @@ func TestUDSAuth_QueryUIDName(t *testing.T) {
 		t.Error("expected no match for different UID")
 	}
 
-	// Error for non-existent user
-	_, err = peerCredQueryUIDName(UDSPeerCreds{UID: uid}, "nonexistent_user_12345")
-	if err == nil {
-		t.Error("expected error for non-existent user")
+	// Non-existent UID matches empty string
+	match, err = peerCredQueryUIDName(UDSPeerCreds{UID: uid + 99999}, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !match {
+		t.Error("expected non-existent UID to match empty string")
+	}
+
+	// Existing UID does not match different username
+	match, err = peerCredQueryUIDName(UDSPeerCreds{UID: uid}, "nonexistent_user_12345")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if match {
+		t.Error("expected no match for different username")
 	}
 }
 
@@ -82,7 +94,7 @@ func TestUDSAuth_QueryGIDName(t *testing.T) {
 		t.Errorf("expected match for current group %q", group.Name)
 	}
 
-	// No match for different GID
+	// No match for different GID (non-existent GID returns empty name)
 	match, err = peerCredQueryGIDName(UDSPeerCreds{GID: gid + 99999}, group.Name)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -91,10 +103,22 @@ func TestUDSAuth_QueryGIDName(t *testing.T) {
 		t.Error("expected no match for different GID")
 	}
 
-	// Error for non-existent group
-	_, err = peerCredQueryGIDName(UDSPeerCreds{GID: gid}, "nonexistent_group_12345")
-	if err == nil {
-		t.Error("expected error for non-existent group")
+	// Non-existent GID matches empty string
+	match, err = peerCredQueryGIDName(UDSPeerCreds{GID: gid + 99999}, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !match {
+		t.Error("expected non-existent GID to match empty string")
+	}
+
+	// Existing GID does not match different group name
+	match, err = peerCredQueryGIDName(UDSPeerCreds{GID: gid}, "nonexistent_group_12345")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if match {
+		t.Error("expected no match for different group name")
 	}
 }
 
