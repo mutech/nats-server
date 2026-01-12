@@ -194,22 +194,36 @@ func Benchmark_Transport_Ping_4(b *testing.B)          { benchTransports(b, ping
 func Benchmark_Transport_Ping_5(b *testing.B)          { benchTransports(b, ping, 5) }
 func Benchmark_Transport_Ping_Cores_x0_5(b *testing.B) { benchTransports(b, ping, runtime.NumCPU()/2) }
 func Benchmark_Transport_Ping_Cores_x1(b *testing.B)   { benchTransports(b, ping, runtime.NumCPU()) }
-func Benchmark_Transport_Ping_Cores_x1_5(b *testing.B) { benchTransports(b, ping, runtime.NumCPU()*3/2) }
+func Benchmark_Transport_Ping_Cores_x1_5(b *testing.B) {
+	benchTransports(b, ping, runtime.NumCPU()*3/2)
+}
 
-func Benchmark_Transport_Pub256_1(b *testing.B)          { benchTransports(b, pub256, 1) }
-func Benchmark_Transport_Pub256_4(b *testing.B)          { benchTransports(b, pub256, 4) }
-func Benchmark_Transport_Pub256_Cores_x0_5(b *testing.B) { benchTransports(b, pub256, runtime.NumCPU()/2) }
-func Benchmark_Transport_Pub256_Cores_x1(b *testing.B)   { benchTransports(b, pub256, runtime.NumCPU()) }
-func Benchmark_Transport_Pub256_Cores_x1_5(b *testing.B) { benchTransports(b, pub256, runtime.NumCPU()*3/2) }
+func Benchmark_Transport_Pub256_1(b *testing.B) { benchTransports(b, pub256, 1) }
+func Benchmark_Transport_Pub256_4(b *testing.B) { benchTransports(b, pub256, 4) }
+func Benchmark_Transport_Pub256_Cores_x0_5(b *testing.B) {
+	benchTransports(b, pub256, runtime.NumCPU()/2)
+}
+func Benchmark_Transport_Pub256_Cores_x1(b *testing.B) { benchTransports(b, pub256, runtime.NumCPU()) }
+func Benchmark_Transport_Pub256_Cores_x1_5(b *testing.B) {
+	benchTransports(b, pub256, runtime.NumCPU()*3/2)
+}
 
-func Benchmark_Transport_Pub512_1(b *testing.B)          { benchTransports(b, pub512, 1) }
-func Benchmark_Transport_Pub512_4(b *testing.B)          { benchTransports(b, pub512, 4) }
-func Benchmark_Transport_Pub512_Cores_x0_5(b *testing.B) { benchTransports(b, pub512, runtime.NumCPU()/2) }
-func Benchmark_Transport_Pub512_Cores_x1(b *testing.B)   { benchTransports(b, pub512, runtime.NumCPU()) }
-func Benchmark_Transport_Pub512_Cores_x1_5(b *testing.B) { benchTransports(b, pub512, runtime.NumCPU()*3/2) }
+func Benchmark_Transport_Pub512_1(b *testing.B) { benchTransports(b, pub512, 1) }
+func Benchmark_Transport_Pub512_4(b *testing.B) { benchTransports(b, pub512, 4) }
+func Benchmark_Transport_Pub512_Cores_x0_5(b *testing.B) {
+	benchTransports(b, pub512, runtime.NumCPU()/2)
+}
+func Benchmark_Transport_Pub512_Cores_x1(b *testing.B) { benchTransports(b, pub512, runtime.NumCPU()) }
+func Benchmark_Transport_Pub512_Cores_x1_5(b *testing.B) {
+	benchTransports(b, pub512, runtime.NumCPU()*3/2)
+}
 
-func Benchmark_Transport_Pub1k_1(b *testing.B)          { benchTransports(b, pub1k, 1) }
-func Benchmark_Transport_Pub1k_4(b *testing.B)          { benchTransports(b, pub1k, 4) }
-func Benchmark_Transport_Pub1k_Cores_x0_5(b *testing.B) { benchTransports(b, pub1k, runtime.NumCPU()/2) }
-func Benchmark_Transport_Pub1k_Cores_x1(b *testing.B)   { benchTransports(b, pub1k, runtime.NumCPU()) }
-func Benchmark_Transport_Pub1k_Cores_x1_5(b *testing.B) { benchTransports(b, pub1k, runtime.NumCPU()*3/2) }
+func Benchmark_Transport_Pub1k_1(b *testing.B) { benchTransports(b, pub1k, 1) }
+func Benchmark_Transport_Pub1k_4(b *testing.B) { benchTransports(b, pub1k, 4) }
+func Benchmark_Transport_Pub1k_Cores_x0_5(b *testing.B) {
+	benchTransports(b, pub1k, runtime.NumCPU()/2)
+}
+func Benchmark_Transport_Pub1k_Cores_x1(b *testing.B) { benchTransports(b, pub1k, runtime.NumCPU()) }
+func Benchmark_Transport_Pub1k_Cores_x1_5(b *testing.B) {
+	benchTransports(b, pub1k, runtime.NumCPU()*3/2)
+}
