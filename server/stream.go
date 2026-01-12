@@ -1,4 +1,4 @@
-// Copyright 2019-2025 The NATS Authors
+// Copyright 2019-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -829,9 +829,9 @@ func (a *Account) addStreamWithAssignment(config *StreamConfig, fsConfig *FileSt
 
 	// Add created timestamp used for the store, must match that of the stream assignment if it exists.
 	if sa != nil {
-		js.mu.RLock()
+		// The following assignment does not require mutex
+		// protection: sa.Created is immutable.
 		mset.created = sa.Created
-		js.mu.RUnlock()
 	}
 
 	// Start our signaling routine to process consumers.
