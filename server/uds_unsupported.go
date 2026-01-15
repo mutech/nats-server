@@ -19,6 +19,7 @@ package server
 
 import (
 	"fmt"
+	"os"
 )
 
 func (c *client) getUDSPeerCreds() (UDSPeerCreds, error) {
@@ -43,7 +44,7 @@ func (s *Server) UDSAcceptLoop(clr chan struct{}) {
 	// Snapshot server options.
 	opts := s.getOpts()
 
-	if opts.UDSPath != _EMPTY_ {
+	if opts.UDS.Path != _EMPTY_ {
 		s.Warnf("UNIX domain sockets are only supported on Linux")
 	}
 	return
@@ -65,4 +66,23 @@ func peerCredQueryPIDGID(c UDSPeerCreds, v string) (bool, error) {
 
 func peerCredQueryPIDGIDName(c UDSPeerCreds, v string) (bool, error) {
 	return false, errUnsupportedPlatform
+}
+
+func parseFileMode(s string) (os.FileMode, error) {
+	return 0, errUnsupportedPlatform
+}
+
+func newUdsSocketSpec(path, group, mode string) (udsSocketSpec, error) {
+	return udsSocketSpec{}, errUnsupportedPlatform
+}
+
+func newDefaultPeerCredQueries() map[string]PeerCredQueryFunc {
+	return nil
+}
+
+func newUDSServerState(opts *Options) (*udsServerState, error) {
+	if opts.UDS.Path != _EMPTY_ {
+		return nil, fmt.Errorf("UDS not supported on this platform")
+	}
+	return nil, nil
 }

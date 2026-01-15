@@ -17,6 +17,8 @@ package server
 
 import (
 	"bufio"
+	"bytes"
+	"flag"
 	"fmt"
 	"net"
 	"os"
@@ -28,7 +30,7 @@ import (
 	"time"
 )
 
-func TestUDSAuth_QueryUIDName(t *testing.T) {
+func TestUDS_Auth_QueryUIDName(t *testing.T) {
 	currentUser, err := user.Current()
 	if err != nil {
 		t.Skipf("current user not available: %v", err)
@@ -72,7 +74,7 @@ func TestUDSAuth_QueryUIDName(t *testing.T) {
 	}
 }
 
-func TestUDSAuth_QueryGIDName(t *testing.T) {
+func TestUDS_Auth_QueryGIDName(t *testing.T) {
 	currentUser, err := user.Current()
 	if err != nil {
 		t.Skipf("current user not available: %v", err)
@@ -122,7 +124,7 @@ func TestUDSAuth_QueryGIDName(t *testing.T) {
 	}
 }
 
-func TestUDSAuth_GetProcessSupplementalGroups(t *testing.T) {
+func TestUDS_Auth_GetProcessSupplementalGroups(t *testing.T) {
 	pid := os.Getpid()
 
 	groups, err := getProcessSupplementalGroups(pid)
@@ -153,7 +155,7 @@ func TestUDSAuth_GetProcessSupplementalGroups(t *testing.T) {
 	}
 }
 
-func TestUDSAuth_QueryPIDGID(t *testing.T) {
+func TestUDS_Auth_QueryPIDGID(t *testing.T) {
 	pid := os.Getpid()
 
 	groups, err := getProcessSupplementalGroups(pid)
@@ -195,7 +197,7 @@ func TestUDSAuth_QueryPIDGID(t *testing.T) {
 	}
 }
 
-func TestUDSAuth_QueryPIDGIDName(t *testing.T) {
+func TestUDS_Auth_QueryPIDGIDName(t *testing.T) {
 	pid := os.Getpid()
 
 	groups, err := getProcessSupplementalGroups(pid)
@@ -236,7 +238,7 @@ func TestUDSAuth_QueryPIDGIDName(t *testing.T) {
 // TestUDSAuth_PeerCredAuth_Integration tests the full UDS peer credential
 // authentication flow: server with UDS + peer cred users, client connects,
 // auth succeeds based on UID.
-func TestUDSAuth_PeerCredAuth_Integration(t *testing.T) {
+func TestUDS_Auth_PeerCredAuth_Integration(t *testing.T) {
 	// Get current UID for the peer cred pattern
 	uid := os.Getuid()
 	uidPattern := fmt.Sprintf("uid=%d", uid)
@@ -250,7 +252,7 @@ func TestUDSAuth_PeerCredAuth_Integration(t *testing.T) {
 		Host:       "127.0.0.1",
 		Port:       -1,
 		DontListen: true, // no TCP
-		UDSPath:    sockPath,
+		UDS:        UDSOptions{Path: sockPath},
 		NoLog:      true,
 		NoSigs:     true,
 		Users: []*User{
@@ -371,5 +373,236 @@ func TestUDSAuth_PeerCredAuth_Integration(t *testing.T) {
 	}
 	if !strings.Contains(line, "Permissions Violation") {
 		t.Fatalf("expected permission violation for explicitly denied subject, got: %q", line)
+	}
+}
+
+func TestUDS_NewSocketSpec(t *testing.T) {
+	// Get root group for name lookup test (always exists)
+	rootGroup, err := user.LookupGroupId("0")
+	if err != nil {
+		t.Fatalf("cannot lookup gid 0: %v", err)
+	}
+
+	tests := []struct {
+		name    string
+		path    string
+		group   string
+		mode    string
+		wantGid int
+		wantErr bool
+		errMsg  string // substring to check in error
+	}{
+		// Valid cases - defaults
+		{"valid path only", "/var/run/nats.sock", "", "", -1, false, ""},
+		{"valid with mode", "/var/run/nats.sock", "", "0660", -1, false, ""},
+
+		// Valid cases - group by numeric GID (Atoi path)
+		{"numeric gid", "/var/run/nats.sock", "1000", "", 1000, false, ""},
+		{"numeric gid 0", "/var/run/nats.sock", "0", "", 0, false, ""},
+
+		// Valid cases - group by name (lookup path)
+		{"group name lookup", "/var/run/nats.sock", rootGroup.Name, "", 0, false, ""},
+
+		// Path attack vectors
+		{"empty path", "", "", "", -1, true, "expect canonical absolute path"},
+		{"relative path", "var/run/nats.sock", "", "", -1, true, "expect canonical absolute path"},
+		{"dot relative", "./nats.sock", "", "", -1, true, "expect canonical absolute path"},
+		{"parent traversal", "/var/run/../nats.sock", "", "", -1, true, "expect canonical absolute path"},
+		{"double slash", "/var//run/nats.sock", "", "", -1, true, "expect canonical absolute path"},
+		{"trailing slash", "/var/run/nats.sock/", "", "", -1, true, "expect canonical absolute path"},
+		{"dot in path", "/var/run/./nats.sock", "", "", -1, true, "expect canonical absolute path"},
+		{"double dot end", "/var/run/nats.sock/..", "", "", -1, true, "expect canonical absolute path"},
+		{"just slash", "/", "", "", -1, false, ""}, // technically valid, will fail at listen
+
+		// Mode validation (parseFileMode tests cover details, verify integration)
+		{"invalid mode format", "/var/run/nats.sock", "", "666", -1, true, "invalid file mode"},
+		{"invalid mode octal", "/var/run/nats.sock", "", "0888", -1, true, "invalid file mode"},
+
+		// Group validation - errors
+		{"nonexistent group name", "/var/run/nats.sock", "nonexistent_group_xyz_12345", "", -1, true, "invalid group"},
+		{"negative gid", "/var/run/nats.sock", "-1", "", -1, true, "negative ID"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spec, err := newUdsSocketSpec(tt.path, tt.group, tt.mode)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("newUdsSocketSpec(%q, %q, %q) error = %v, wantErr %v",
+					tt.path, tt.group, tt.mode, err, tt.wantErr)
+				return
+			}
+			if tt.wantErr && tt.errMsg != "" && !strings.Contains(err.Error(), tt.errMsg) {
+				t.Errorf("error %q should contain %q", err.Error(), tt.errMsg)
+			}
+			if !tt.wantErr {
+				if spec.path != tt.path {
+					t.Errorf("spec.path = %q, want %q", spec.path, tt.path)
+				}
+				if spec.gid != tt.wantGid {
+					t.Errorf("spec.gid = %d, want %d", spec.gid, tt.wantGid)
+				}
+			}
+		})
+	}
+}
+
+func TestUDS_ParseFileMode(t *testing.T) {
+	tests := []struct {
+		input   string
+		want    os.FileMode
+		wantErr bool
+	}{
+		// Valid modes
+		{"0000", 0o000, false},
+		{"0600", 0o600, false},
+		{"0644", 0o644, false},
+		{"0660", 0o660, false},
+		{"0700", 0o700, false},
+		{"0755", 0o755, false},
+		{"0777", 0o777, false},
+
+		// Wrong length
+		{"", 0, true},
+		{"0", 0, true},
+		{"00", 0, true},
+		{"000", 0, true},
+		{"00000", 0, true},
+		{"07777", 0, true},
+
+		// Wrong first char
+		{"1777", 0, true},
+		{"a777", 0, true},
+		{" 777", 0, true},
+
+		// Invalid octal digit in position 1
+		{"0800", 0, true},
+		{"0900", 0, true},
+		{"0a00", 0, true},
+
+		// Invalid octal digit in position 2
+		{"0080", 0, true},
+		{"0090", 0, true},
+		{"00a0", 0, true},
+
+		// Invalid octal digit in position 3
+		{"0008", 0, true},
+		{"0009", 0, true},
+		{"000a", 0, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got, err := parseFileMode(tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("parseFileMode(%q) error = %v, wantErr %v", tt.input, err, tt.wantErr)
+				return
+			}
+			if !tt.wantErr && got != tt.want {
+				t.Errorf("parseFileMode(%q) = %o, want %o", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestUDS_CLI_Option(t *testing.T) {
+	defer func() { FlagSnapshot = nil }()
+
+	// Helper to parse CLI args and return options
+	mustNotFail := func(args []string) *Options {
+		fs := flag.NewFlagSet("test", flag.ContinueOnError)
+		opts, err := ConfigureOptions(fs, args, PrintServerAndExit, fs.Usage, PrintTLSHelpAndDie)
+		if err != nil {
+			t.Fatalf("Error on configure: %v", err)
+		}
+		return opts
+	}
+
+	// Helper to expect failure
+	expectToFail := func(args []string) {
+		fs := flag.NewFlagSet("test", flag.ContinueOnError)
+		fs.SetOutput(&bytes.Buffer{}) // silence errors
+		opts, err := ConfigureOptions(fs, args, PrintServerAndExit, fs.Usage, PrintTLSHelpAndDie)
+		if opts != nil || err == nil {
+			t.Fatalf("Expected error for args %v, got opts=%v err=%v", args, opts, err)
+		}
+	}
+
+	// Basic path only
+	opts := mustNotFail([]string{"--uds", "/tmp/nats.sock"})
+	if opts.UDS.Path != "/tmp/nats.sock" {
+		t.Fatalf("Expected path /tmp/nats.sock, got %q", opts.UDS.Path)
+	}
+
+	// Path with group
+	opts = mustNotFail([]string{"--uds", "/tmp/nats.sock;group=nats"})
+	if opts.UDS.Path != "/tmp/nats.sock" || opts.UDS.Group != "nats" {
+		t.Fatalf("Expected path=/tmp/nats.sock group=nats, got path=%q group=%q", opts.UDS.Path, opts.UDS.Group)
+	}
+
+	// Path with mode
+	opts = mustNotFail([]string{"--uds", "/tmp/nats.sock;mode=0660"})
+	if opts.UDS.Path != "/tmp/nats.sock" || opts.UDS.Mode != "0660" {
+		t.Fatalf("Expected path=/tmp/nats.sock mode=0660, got path=%q mode=%q", opts.UDS.Path, opts.UDS.Mode)
+	}
+
+	// Path with group and mode
+	opts = mustNotFail([]string{"--uds", "/tmp/nats.sock;group=nats;mode=0660"})
+	if opts.UDS.Path != "/tmp/nats.sock" || opts.UDS.Group != "nats" || opts.UDS.Mode != "0660" {
+		t.Fatalf("Expected path=/tmp/nats.sock group=nats mode=0660, got path=%q group=%q mode=%q",
+			opts.UDS.Path, opts.UDS.Group, opts.UDS.Mode)
+	}
+
+	// Empty value should fail
+	expectToFail([]string{"--uds", ""})
+
+	// Missing path should fail
+	expectToFail([]string{"--uds", ";group=nats"})
+}
+
+func TestUDS_Config_Block(t *testing.T) {
+	// Create temp config file with uds block
+	conf := `
+		uds {
+			path: "/tmp/nats.sock"
+			group: "nats"
+			mode: "0660"
+		}
+	`
+	confFile := filepath.Join(t.TempDir(), "test.conf")
+	if err := os.WriteFile(confFile, []byte(conf), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+
+	opts, err := ProcessConfigFile(confFile)
+	if err != nil {
+		t.Fatalf("Error processing config: %v", err)
+	}
+
+	if opts.UDS.Path != "/tmp/nats.sock" {
+		t.Errorf("Expected path /tmp/nats.sock, got %q", opts.UDS.Path)
+	}
+	if opts.UDS.Group != "nats" {
+		t.Errorf("Expected group nats, got %q", opts.UDS.Group)
+	}
+	if opts.UDS.Mode != "0660" {
+		t.Errorf("Expected mode 0660, got %q", opts.UDS.Mode)
+	}
+}
+
+func TestUDS_Config_PathOnly(t *testing.T) {
+	// Test path-only config (no group/mode)
+	conf := `uds { path: "/tmp/nats.sock" }`
+	confFile := filepath.Join(t.TempDir(), "test.conf")
+	if err := os.WriteFile(confFile, []byte(conf), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+
+	opts, err := ProcessConfigFile(confFile)
+	if err != nil {
+		t.Fatalf("Error processing config: %v", err)
+	}
+
+	if opts.UDS.Path != "/tmp/nats.sock" {
+		t.Errorf("Expected path /tmp/nats.sock, got %q", opts.UDS.Path)
 	}
 }

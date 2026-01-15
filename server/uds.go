@@ -17,8 +17,67 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"strings"
 	"time"
 )
+
+// UDSOptions holds UNIX domain socket configuration options.
+type UDSOptions struct {
+	Path  string
+	Group string
+	Mode  string
+}
+
+// UDSInfo is the UDS information exposed to clients in the INFO message.
+type UDSInfo struct {
+	Path string `json:"path"`
+}
+
+// ParseUDSOption parses a UDS option string in the format "/path;group=grp;mode=0660".
+// The path is required, group and mode are optional.
+func ParseUDSOption(s string) (UDSOptions, error) {
+	var opts UDSOptions
+	parts := strings.Split(s, ";")
+	opts.Path = parts[0]
+
+	if opts.Path == _EMPTY_ {
+		return UDSOptions{}, fmt.Errorf("invalid path: '' (expected absolute path to UNIX domain socket)")
+	}
+
+	for _, part := range parts[1:] {
+		if part == _EMPTY_ {
+			continue
+		}
+		kv := strings.SplitN(part, "=", 2)
+		if len(kv) != 2 {
+			return UDSOptions{}, fmt.Errorf("invalid UDS option format: %q (expected <option>=<value>)", part)
+		}
+		key, value := kv[0], kv[1]
+		switch key {
+		case "group":
+			opts.Group = value
+		case "mode":
+			opts.Mode = value
+		default:
+			return UDSOptions{}, fmt.Errorf("unknown UDS option: %q (expected 'group' or 'mode')", key)
+		}
+	}
+
+	return opts, nil
+}
+
+type udsSocketSpec struct {
+	path string
+	gid  int // -1 = no change
+	mode int // -1 = no change, 0 = 0000
+}
+
+type udsServerState struct {
+	socket                udsSocketSpec
+	listener              net.Listener
+	listenerErr           error
+	peerCredentialQueries map[string]PeerCredQueryFunc
+}
 
 // Connection types are defined in nats-io/jwt, I don't want to fork that just for a constant.
 // This type is "reused" to differentiate permission granting/restricting rules from
@@ -57,7 +116,14 @@ func (c *client) isUDSPeer() bool {
 }
 
 func (s *Server) hasUDSPeerCredentialSupport() bool {
-	return s.udsPeerCredQueries != nil
+	return s.uds != nil && s.uds.peerCredentialQueries != nil
+}
+
+func (s *Server) udsListenerErr() error {
+	if s.uds == nil {
+		return nil
+	}
+	return s.uds.listenerErr
 }
 
 // Determines if a user name can be a peer credential pattern and is likely not
@@ -202,11 +268,11 @@ func peerCredsMatchPattern(queries map[string]PeerCredQueryFunc, creds UDSPeerCr
 
 // udsPeerCredsMatchPattern is a Server method wrapper for peerCredsMatchPattern.
 func (s *Server) udsPeerCredsMatchPattern(creds UDSPeerCreds, pattern string) (bool, error) {
-	if s.udsPeerCredQueries == nil {
+	if s.uds == nil || s.uds.peerCredentialQueries == nil {
 		s.Fatalf("udsPeerCredsMatchPattern called with nil query registry")
 		return false, nil // unreachable, but satisfies compiler
 	}
-	return peerCredsMatchPattern(s.udsPeerCredQueries, creds, pattern)
+	return peerCredsMatchPattern(s.uds.peerCredentialQueries, creds, pattern)
 }
 
 type udsPeerAuthResult struct {
@@ -321,12 +387,11 @@ func (s *Server) RegisterUDSPeerCredQuery(query string, fn PeerCredQueryFunc) (P
 	if s.isRunning() {
 		return nil, fmt.Errorf("cannot register UDS peer credential query after server start")
 	}
-	if s.udsPeerCredQueries == nil {
-		// not started, no lock needed
-		s.initializePeerCredQueries()
+	if s.uds == nil {
+		return nil, fmt.Errorf("UDS not configured")
 	}
-	result := s.udsPeerCredQueries[query]
-	s.udsPeerCredQueries[query] = fn
+	result := s.uds.peerCredentialQueries[query]
+	s.uds.peerCredentialQueries[query] = fn
 	return result, nil
 }
 
@@ -352,20 +417,4 @@ func peerCredQueryPID(c UDSPeerCreds, v string) (bool, error) {
 		return false, fmt.Errorf("invalid pid value %q: %w", v, err)
 	}
 	return c.PID == id, nil
-}
-
-// Initializes peercred queries if not yet done
-func (s *Server) initializePeerCredQueries() {
-	if s.udsPeerCredQueries == nil {
-		s.udsPeerCredQueries = map[string]PeerCredQueryFunc{
-			"uid":          peerCredQueryUID,
-			"gid":          peerCredQueryGID,
-			"pid":          peerCredQueryPID,
-			"uid:name":     peerCredQueryUIDName,
-			"gid:name":     peerCredQueryGIDName,
-			"pid:gid":      peerCredQueryPIDGID,
-			"pid:gid:name": peerCredQueryPIDGIDName,
-		}
-		// TODO: implement query for pid:systemd-unit
-	}
 }

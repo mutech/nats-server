@@ -22,9 +22,11 @@ import (
 	"net"
 	"os"
 	"os/user"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 )
 
 func (c *client) getUDSPeerCreds() (UDSPeerCreds, error) {
@@ -77,16 +79,20 @@ func (s *Server) UDSAcceptLoop(clr chan struct{}) {
 	// Snapshot server options.
 	opts := s.getOpts()
 
-	if opts.UDSPath == _EMPTY_ {
+	if opts.UDS.Path == _EMPTY_ {
 		return
 	}
 
 	// Setup state that can enable shutdown
 	s.mu.Lock()
-	path := opts.UDSPath
-	if s.udsListener == nil {
-		s.udsListener, s.udsListenerErr = natsListen("unix", path)
-		if s.udsListenerErr != nil {
+	if s.uds == nil {
+		s.mu.Unlock()
+		return
+	}
+	path := s.uds.socket.path
+	if s.uds.listener == nil {
+		s.uds.listener, s.uds.listenerErr = natsListen("unix", path)
+		if s.uds.listenerErr != nil {
 			conn, dialErr := net.Dial("unix", path)
 			if dialErr == nil {
 				defer conn.Close()
@@ -105,14 +111,22 @@ func (s *Server) UDSAcceptLoop(clr chan struct{}) {
 			// Dial failed - socket is stale, remove and retry
 			s.Noticef("UNIX domain socket %s appears stale, removing...", path)
 			os.Remove(path)
-			s.udsListener, s.udsListenerErr = natsListen("unix", path)
+			s.uds.listener, s.uds.listenerErr = natsListen("unix", path)
 		}
 	}
-	if s.udsListenerErr != nil {
+	if s.uds.listenerErr != nil {
 		s.mu.Unlock()
-		s.Fatalf("Error listening on UNIX domain socket: %s, %q", path, s.udsListenerErr)
+		s.Fatalf("Error listening on UNIX domain socket: %s, %q", path, s.uds.listenerErr)
 		return
 	}
+
+	// Apply socket permissions if configured
+	if err := applyUdsPermissions(s.uds.listener, path, s.uds.socket.gid, s.uds.socket.mode); err != nil {
+		s.mu.Unlock()
+		s.Fatalf("Error setting UNIX domain socket permissions: %v", err)
+		return
+	}
+
 	s.Noticef("Listening for client connections on UNIX domain socket %s", path)
 
 	// Alert if PROXY protocol is enabled
@@ -128,15 +142,12 @@ func (s *Server) UDSAcceptLoop(clr chan struct{}) {
 		}
 	}
 
-	s.info.UDSPath = path
-
-	// Initialize peercred query handlers (s.mu already held)
-	s.initializePeerCredQueries()
+	s.info.UDS = []UDSInfo{{Path: path}}
 
 	// We do not advertize UDS sockets since they are not remotely available and clients connected
 	// via UDS already know the path. Advertizing local UDS to remote is useless and might break clients.
 
-	go s.acceptConnections(s.udsListener, "Client",
+	go s.acceptConnections(s.uds.listener, "Client",
 		func(conn net.Conn) {
 			s.createClient(conn)
 			// TODO: perform UDS specific initialization, either here or in createClient()
@@ -261,4 +272,130 @@ func peerCredQueryPIDGIDName(c UDSPeerCreds, v string) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+// applyUdsPermissions sets group ownership and mode on the socket file.
+// Also drains and closes any connections that may have been accepted during
+// the race window between listen() and permission application.
+func applyUdsPermissions(listener net.Listener, path string, gid, mode int) error {
+	// Apply permissions first
+	if gid >= 0 {
+		if err := os.Chown(path, -1, gid); err != nil {
+			return fmt.Errorf("chown %s: %w", path, err)
+		}
+	}
+	if mode >= 0 {
+		if err := os.Chmod(path, os.FileMode(mode)); err != nil {
+			return fmt.Errorf("chmod %s: %w", path, err)
+		}
+	}
+
+	// Drain any connections that snuck in during the race window
+	if gid >= 0 || mode >= 0 {
+		unixListener := listener.(*net.UnixListener)
+		unixListener.SetDeadline(time.Now())
+		for {
+			conn, err := unixListener.Accept()
+			if err != nil {
+				break // No more pending connections (or deadline hit)
+			}
+			conn.Close() // Reject connection from race window
+		}
+		unixListener.SetDeadline(time.Time{}) // Clear deadline
+	}
+
+	return nil
+}
+
+// newDefaultPeerCredQueries returns the default peer credential query handlers.
+func newDefaultPeerCredQueries() map[string]PeerCredQueryFunc {
+	return map[string]PeerCredQueryFunc{
+		"uid":          peerCredQueryUID,
+		"gid":          peerCredQueryGID,
+		"pid":          peerCredQueryPID,
+		"uid:name":     peerCredQueryUIDName,
+		"gid:name":     peerCredQueryGIDName,
+		"pid:gid":      peerCredQueryPIDGID,
+		"pid:gid:name": peerCredQueryPIDGIDName,
+	}
+}
+
+// newUDSServerState creates UDS server state from options.
+// Returns nil, nil if UDS is not configured.
+func newUDSServerState(opts *Options) (*udsServerState, error) {
+	if opts.UDS.Path == _EMPTY_ {
+		return nil, nil
+	}
+	spec, err := newUdsSocketSpec(opts.UDS.Path, opts.UDS.Group, opts.UDS.Mode)
+	if err != nil {
+		return nil, fmt.Errorf("UDS configuration error: %w", err)
+	}
+	return &udsServerState{
+		socket:                spec,
+		peerCredentialQueries: newDefaultPeerCredQueries(),
+	}, nil
+}
+
+// newUdsSocketSpec creates a validated udsSocketSpec from raw config values.
+// path required to be absolute and canonical (no .., //, etc.), group and mode are optional (empty string = no change after listen).
+func newUdsSocketSpec(path, group, mode string) (udsSocketSpec, error) {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return udsSocketSpec{}, fmt.Errorf("invalid path '%s', expect canonical absolute path", path)
+	}
+
+	spec := udsSocketSpec{
+		path: path,
+		gid:  -1,
+		mode: -1,
+	}
+
+	if mode != "" {
+		m, err := parseFileMode(mode)
+		if err != nil {
+			return udsSocketSpec{}, err
+		}
+		spec.mode = int(m)
+	}
+
+	if group != "" {
+		// Try numeric GID first
+		if gid, err := strconv.Atoi(group); err == nil {
+			if gid < 0 {
+				return udsSocketSpec{}, fmt.Errorf("invalid group '%s': negative ID", group)
+			}
+			spec.gid = gid
+		} else {
+			// Fall back to group name lookup
+			g, err := user.LookupGroup(group)
+			if err != nil {
+				return udsSocketSpec{}, fmt.Errorf("invalid group '%s': %w", group, err)
+			}
+			gid, err := strconv.Atoi(g.Gid)
+			if err != nil {
+				return udsSocketSpec{}, fmt.Errorf("invalid group '%s'.Gid: '%s': %w", group, g.Gid, err)
+			}
+			spec.gid = gid
+		}
+	}
+
+	return spec, nil
+}
+
+// parseFileMode parses a 4-digit octal mode string (e.g. "0660") to os.FileMode.
+func parseFileMode(s string) (os.FileMode, error) {
+	if len(s) != 4 || s[0] != '0' {
+		return 0, fmt.Errorf("invalid file mode '%s', expected 4 digit octal (e.g. 0660)", s)
+	}
+	var m os.FileMode
+	for i := 1; i < 4; i++ {
+		d := s[i] - '0'
+		if d > 7 {
+			return 0, fmt.Errorf("invalid file mode '%s', expected 4 digit octal (e.g. 0660)", s)
+		}
+		m = m<<3 | os.FileMode(d)
+	}
+	if m > 0o777 {
+		panic("Contract violation: investigate parseFileMode")
+	}
+	return m, nil
 }

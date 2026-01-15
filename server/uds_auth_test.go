@@ -18,7 +18,7 @@ import (
 	"testing"
 )
 
-func TestUDSAuth_MaybePeerCredPattern_Valid(t *testing.T) {
+func TestUDS_Auth_MaybePeerCredPattern_Valid(t *testing.T) {
 	valid := []string{
 		"uid=", "gid=", "pid=",
 		"uid:", "gid:", "pid:",
@@ -33,7 +33,7 @@ func TestUDSAuth_MaybePeerCredPattern_Valid(t *testing.T) {
 	}
 }
 
-func TestUDSAuth_MaybePeerCredPattern_Invalid(t *testing.T) {
+func TestUDS_Auth_MaybePeerCredPattern_Invalid(t *testing.T) {
 	invalid := []string{
 		"", "u", "ui", "uid",
 		"xid=1", "uix=1", "uidx",
@@ -47,7 +47,7 @@ func TestUDSAuth_MaybePeerCredPattern_Invalid(t *testing.T) {
 	}
 }
 
-func TestUDSAuth_ScanPeerCredToken_Basic(t *testing.T) {
+func TestUDS_Auth_ScanPeerCredToken_Basic(t *testing.T) {
 	tests := []struct {
 		pattern string
 		query   string
@@ -84,7 +84,7 @@ func TestUDSAuth_ScanPeerCredToken_Basic(t *testing.T) {
 	}
 }
 
-func TestUDSAuth_ScanPeerCredToken_MultipleTokens(t *testing.T) {
+func TestUDS_Auth_ScanPeerCredToken_MultipleTokens(t *testing.T) {
 	pattern := "uid=1000,gid=100,pid!=1"
 
 	tok1, err := scanPeerCredToken(pattern, 0)
@@ -112,7 +112,7 @@ func TestUDSAuth_ScanPeerCredToken_MultipleTokens(t *testing.T) {
 	}
 }
 
-func TestUDSAuth_ScanPeerCredToken_LeadingSpaces(t *testing.T) {
+func TestUDS_Auth_ScanPeerCredToken_LeadingSpaces(t *testing.T) {
 	tok, err := scanPeerCredToken("uid=1000, gid=100", 9)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -130,7 +130,7 @@ func TestUDSAuth_ScanPeerCredToken_LeadingSpaces(t *testing.T) {
 	}
 }
 
-func TestUDSAuth_ScanPeerCredToken_Errors(t *testing.T) {
+func TestUDS_Auth_ScanPeerCredToken_Errors(t *testing.T) {
 	tests := []struct {
 		name    string
 		pattern string
@@ -162,8 +162,8 @@ func TestUDSAuth_ScanPeerCredToken_Errors(t *testing.T) {
 	}
 }
 
-func TestUDSAuth_MatchPattern_EmptyPattern(t *testing.T) {
-	s := &Server{udsPeerCredQueries: map[string]PeerCredQueryFunc{}}
+func TestUDS_Auth_MatchPattern_EmptyPattern(t *testing.T) {
+	s := &Server{uds: &udsServerState{peerCredentialQueries: map[string]PeerCredQueryFunc{}}}
 	creds := UDSPeerCreds{UID: 1000, GID: 100, PID: 1234}
 
 	matched, err := s.udsPeerCredsMatchPattern(creds, "")
@@ -175,12 +175,12 @@ func TestUDSAuth_MatchPattern_EmptyPattern(t *testing.T) {
 	}
 }
 
-func TestUDSAuth_MatchPattern_SingleToken(t *testing.T) {
-	s := &Server{udsPeerCredQueries: map[string]PeerCredQueryFunc{
+func TestUDS_Auth_MatchPattern_SingleToken(t *testing.T) {
+	s := &Server{uds: &udsServerState{peerCredentialQueries: map[string]PeerCredQueryFunc{
 		"uid": func(c UDSPeerCreds, v string) (bool, error) {
 			return fmt.Sprintf("%d", c.UID) == v, nil
 		},
-	}}
+	}}}
 	creds := UDSPeerCreds{UID: 1000, GID: 100, PID: 1234}
 
 	matched, err := s.udsPeerCredsMatchPattern(creds, "uid=1000")
@@ -200,12 +200,12 @@ func TestUDSAuth_MatchPattern_SingleToken(t *testing.T) {
 	}
 }
 
-func TestUDSAuth_MatchPattern_Negation(t *testing.T) {
-	s := &Server{udsPeerCredQueries: map[string]PeerCredQueryFunc{
+func TestUDS_Auth_MatchPattern_Negation(t *testing.T) {
+	s := &Server{uds: &udsServerState{peerCredentialQueries: map[string]PeerCredQueryFunc{
 		"uid": func(c UDSPeerCreds, v string) (bool, error) {
 			return fmt.Sprintf("%d", c.UID) == v, nil
 		},
-	}}
+	}}}
 	creds := UDSPeerCreds{UID: 1000, GID: 100, PID: 1234}
 
 	matched, err := s.udsPeerCredsMatchPattern(creds, "uid!=0")
@@ -225,15 +225,15 @@ func TestUDSAuth_MatchPattern_Negation(t *testing.T) {
 	}
 }
 
-func TestUDSAuth_MatchPattern_MultipleTokensAND(t *testing.T) {
-	s := &Server{udsPeerCredQueries: map[string]PeerCredQueryFunc{
+func TestUDS_Auth_MatchPattern_MultipleTokensAND(t *testing.T) {
+	s := &Server{uds: &udsServerState{peerCredentialQueries: map[string]PeerCredQueryFunc{
 		"uid": func(c UDSPeerCreds, v string) (bool, error) {
 			return fmt.Sprintf("%d", c.UID) == v, nil
 		},
 		"gid": func(c UDSPeerCreds, v string) (bool, error) {
 			return fmt.Sprintf("%d", c.GID) == v, nil
 		},
-	}}
+	}}}
 	creds := UDSPeerCreds{UID: 1000, GID: 100, PID: 1234}
 
 	matched, err := s.udsPeerCredsMatchPattern(creds, "uid=1000,gid=100")
@@ -261,8 +261,8 @@ func TestUDSAuth_MatchPattern_MultipleTokensAND(t *testing.T) {
 	}
 }
 
-func TestUDSAuth_MatchPattern_UnknownQuery(t *testing.T) {
-	s := &Server{udsPeerCredQueries: map[string]PeerCredQueryFunc{}}
+func TestUDS_Auth_MatchPattern_UnknownQuery(t *testing.T) {
+	s := &Server{uds: &udsServerState{peerCredentialQueries: map[string]PeerCredQueryFunc{}}}
 	creds := UDSPeerCreds{UID: 1000, GID: 100, PID: 1234}
 
 	_, err := s.udsPeerCredsMatchPattern(creds, "uid=1000")
@@ -271,12 +271,12 @@ func TestUDSAuth_MatchPattern_UnknownQuery(t *testing.T) {
 	}
 }
 
-func TestUDSAuth_MatchPattern_HandlerError(t *testing.T) {
-	s := &Server{udsPeerCredQueries: map[string]PeerCredQueryFunc{
+func TestUDS_Auth_MatchPattern_HandlerError(t *testing.T) {
+	s := &Server{uds: &udsServerState{peerCredentialQueries: map[string]PeerCredQueryFunc{
 		"uid": func(c UDSPeerCreds, v string) (bool, error) {
 			return false, fmt.Errorf("lookup failed")
 		},
-	}}
+	}}}
 	creds := UDSPeerCreds{UID: 1000, GID: 100, PID: 1234}
 
 	_, err := s.udsPeerCredsMatchPattern(creds, "uid=1000")
@@ -285,10 +285,10 @@ func TestUDSAuth_MatchPattern_HandlerError(t *testing.T) {
 	}
 }
 
-func TestUDSAuth_MatchPattern_InvalidPattern(t *testing.T) {
-	s := &Server{udsPeerCredQueries: map[string]PeerCredQueryFunc{
+func TestUDS_Auth_MatchPattern_InvalidPattern(t *testing.T) {
+	s := &Server{uds: &udsServerState{peerCredentialQueries: map[string]PeerCredQueryFunc{
 		"uid": func(c UDSPeerCreds, v string) (bool, error) { return true, nil },
-	}}
+	}}}
 	creds := UDSPeerCreds{UID: 1000, GID: 100, PID: 1234}
 
 	invalid := []string{
@@ -306,8 +306,12 @@ func TestUDSAuth_MatchPattern_InvalidPattern(t *testing.T) {
 	}
 }
 
-func TestUDSAuth_RegisterQuery(t *testing.T) {
-	s := &Server{}
+func TestUDS_Auth_RegisterQuery(t *testing.T) {
+	uds, err := newUDSServerState(&Options{UDS: UDSOptions{Path: "/tmp/test.sock"}})
+	if err != nil {
+		t.Fatalf("newUDSServerState failed: %v", err)
+	}
+	s := &Server{uds: uds}
 
 	called := false
 	fn := func(c UDSPeerCreds, v string) (bool, error) {
@@ -323,21 +327,22 @@ func TestUDSAuth_RegisterQuery(t *testing.T) {
 		t.Error("expected nil previous handler")
 	}
 
-	if s.udsPeerCredQueries == nil {
-		t.Fatal("queries map not initialized")
-	}
-	if s.udsPeerCredQueries["test"] == nil {
+	if s.uds.peerCredentialQueries["test"] == nil {
 		t.Fatal("handler not registered")
 	}
 
-	s.udsPeerCredQueries["test"](UDSPeerCreds{}, "")
+	s.uds.peerCredentialQueries["test"](UDSPeerCreds{}, "")
 	if !called {
 		t.Error("registered handler not called")
 	}
 }
 
-func TestUDSAuth_RegisterQuery_Replace(t *testing.T) {
-	s := &Server{}
+func TestUDS_Auth_RegisterQuery_Replace(t *testing.T) {
+	uds, err := newUDSServerState(&Options{UDS: UDSOptions{Path: "/tmp/test.sock"}})
+	if err != nil {
+		t.Fatalf("newUDSServerState failed: %v", err)
+	}
+	s := &Server{uds: uds}
 
 	fn1 := func(c UDSPeerCreds, v string) (bool, error) { return false, nil }
 	fn2 := func(c UDSPeerCreds, v string) (bool, error) { return true, nil }
@@ -349,13 +354,23 @@ func TestUDSAuth_RegisterQuery_Replace(t *testing.T) {
 		t.Error("expected previous handler")
 	}
 
-	result, _ := s.udsPeerCredQueries["test"](UDSPeerCreds{}, "")
+	result, _ := s.uds.peerCredentialQueries["test"](UDSPeerCreds{}, "")
 	if !result {
 		t.Error("new handler should return true")
 	}
 }
 
-func TestUDSAuth_AuthenticatePeer_EmptyUsers(t *testing.T) {
+func TestUDS_Auth_RegisterQuery_NoUDS(t *testing.T) {
+	s := &Server{}
+
+	fn := func(c UDSPeerCreds, v string) (bool, error) { return true, nil }
+	_, err := s.RegisterUDSPeerCredQuery("test", fn)
+	if err == nil {
+		t.Error("expected error when UDS not configured")
+	}
+}
+
+func TestUDS_Auth_AuthenticatePeer_EmptyUsers(t *testing.T) {
 	result, err := udsAuthenticatePeer(map[string]*User{}, nil, UDSPeerCreds{UID: 1000})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -371,7 +386,7 @@ var defaultPeerCredQueries = map[string]PeerCredQueryFunc{
 	"pid": peerCredQueryPID,
 }
 
-func TestUDSAuth_AuthenticatePeer_NoMatchingPattern(t *testing.T) {
+func TestUDS_Auth_AuthenticatePeer_NoMatchingPattern(t *testing.T) {
 	users := map[string]*User{
 		"uid=2000": {
 			Username:               "uid=2000",
@@ -389,7 +404,7 @@ func TestUDSAuth_AuthenticatePeer_NoMatchingPattern(t *testing.T) {
 	}
 }
 
-func TestUDSAuth_AuthenticatePeer_NoAuthenticatingRule(t *testing.T) {
+func TestUDS_Auth_AuthenticatePeer_NoAuthenticatingRule(t *testing.T) {
 	users := map[string]*User{
 		"uid=1000": {
 			Username:    "uid=1000",
@@ -406,7 +421,7 @@ func TestUDSAuth_AuthenticatePeer_NoAuthenticatingRule(t *testing.T) {
 	}
 }
 
-func TestUDSAuth_AuthenticatePeer_NoPermissionsDefined(t *testing.T) {
+func TestUDS_Auth_AuthenticatePeer_NoPermissionsDefined(t *testing.T) {
 	users := map[string]*User{
 		"uid=1000": {
 			Username:               "uid=1000",
@@ -426,7 +441,7 @@ func TestUDSAuth_AuthenticatePeer_NoPermissionsDefined(t *testing.T) {
 	}
 }
 
-func TestUDSAuth_AuthenticatePeer_EmptyPermissions(t *testing.T) {
+func TestUDS_Auth_AuthenticatePeer_EmptyPermissions(t *testing.T) {
 	users := map[string]*User{
 		"uid=1000": {
 			Username:               "uid=1000",
@@ -447,7 +462,7 @@ func TestUDSAuth_AuthenticatePeer_EmptyPermissions(t *testing.T) {
 	}
 }
 
-func TestUDSAuth_AuthenticatePeer_ConflictingAccounts(t *testing.T) {
+func TestUDS_Auth_AuthenticatePeer_ConflictingAccounts(t *testing.T) {
 	users := map[string]*User{
 		"uid=1000": {Username: "uid=1000", Account: &Account{Name: "acc1"}},
 		"gid=1000": {Username: "gid=1000", Account: &Account{Name: "acc2"}},
@@ -459,7 +474,7 @@ func TestUDSAuth_AuthenticatePeer_ConflictingAccounts(t *testing.T) {
 	}
 }
 
-func TestUDSAuth_AuthenticatePeer_WithAccount(t *testing.T) {
+func TestUDS_Auth_AuthenticatePeer_WithAccount(t *testing.T) {
 	acc := &Account{Name: "testaccount"}
 	users := map[string]*User{
 		"uid=1000": {
@@ -484,7 +499,7 @@ func TestUDSAuth_AuthenticatePeer_WithAccount(t *testing.T) {
 	}
 }
 
-func TestUDSAuth_AuthenticatePeer_WithConnectionType(t *testing.T) {
+func TestUDS_Auth_AuthenticatePeer_WithConnectionType(t *testing.T) {
 	users := map[string]*User{
 		"uid=1000": {
 			Username:               "uid=1000",
@@ -505,7 +520,7 @@ func TestUDSAuth_AuthenticatePeer_WithConnectionType(t *testing.T) {
 	}
 }
 
-func TestUDSAuth_AuthenticatePeer_PermissionsMerged(t *testing.T) {
+func TestUDS_Auth_AuthenticatePeer_PermissionsMerged(t *testing.T) {
 	users := map[string]*User{
 		"uid=1000": {
 			Username:               "uid=1000",
@@ -530,7 +545,7 @@ func TestUDSAuth_AuthenticatePeer_PermissionsMerged(t *testing.T) {
 	}
 }
 
-func TestUDSAuth_AuthenticatePeer_AccountRuleOverridesAuthRule(t *testing.T) {
+func TestUDS_Auth_AuthenticatePeer_AccountRuleOverridesAuthRule(t *testing.T) {
 	users := map[string]*User{
 		"uid=1000": {
 			Username:               "uid=1000",
@@ -556,7 +571,7 @@ func TestUDSAuth_AuthenticatePeer_AccountRuleOverridesAuthRule(t *testing.T) {
 	}
 }
 
-func TestUDSAuth_AuthenticatePeer_ResponsePermissionsMerged(t *testing.T) {
+func TestUDS_Auth_AuthenticatePeer_ResponsePermissionsMerged(t *testing.T) {
 	users := map[string]*User{
 		"uid=1000": {
 			Username:               "uid=1000",
@@ -590,7 +605,7 @@ func TestUDSAuth_AuthenticatePeer_ResponsePermissionsMerged(t *testing.T) {
 	}
 }
 
-func TestUDSAuth_AuthenticatePeer_DenyListsMerged(t *testing.T) {
+func TestUDS_Auth_AuthenticatePeer_DenyListsMerged(t *testing.T) {
 	users := map[string]*User{
 		"uid=1000": {
 			Username:               "uid=1000",
@@ -621,7 +636,7 @@ func TestUDSAuth_AuthenticatePeer_DenyListsMerged(t *testing.T) {
 	}
 }
 
-func TestUDSAuth_AuthenticatePeer_IdentityFormat(t *testing.T) {
+func TestUDS_Auth_AuthenticatePeer_IdentityFormat(t *testing.T) {
 	users := map[string]*User{
 		"uid=1000": {
 			Username:               "uid=1000",
@@ -639,7 +654,7 @@ func TestUDSAuth_AuthenticatePeer_IdentityFormat(t *testing.T) {
 	}
 }
 
-func TestUDSAuth_AuthenticatePeer_MixedPubSubPermissions(t *testing.T) {
+func TestUDS_Auth_AuthenticatePeer_MixedPubSubPermissions(t *testing.T) {
 	users := map[string]*User{
 		"uid=1000": {
 			Username:               "uid=1000",
@@ -664,7 +679,7 @@ func TestUDSAuth_AuthenticatePeer_MixedPubSubPermissions(t *testing.T) {
 	}
 }
 
-func TestUDSAuth_AuthenticatePeer_PatternError(t *testing.T) {
+func TestUDS_Auth_AuthenticatePeer_PatternError(t *testing.T) {
 	users := map[string]*User{
 		"uid=1000": {
 			Username:               "uid=1000",
@@ -679,7 +694,7 @@ func TestUDSAuth_AuthenticatePeer_PatternError(t *testing.T) {
 	}
 }
 
-func TestUDSAuth_QueryUID(t *testing.T) {
+func TestUDS_Auth_QueryUID(t *testing.T) {
 	tests := []struct {
 		uid   int
 		value string
@@ -707,7 +722,7 @@ func TestUDSAuth_QueryUID(t *testing.T) {
 	}
 }
 
-func TestUDSAuth_QueryGID(t *testing.T) {
+func TestUDS_Auth_QueryGID(t *testing.T) {
 	tests := []struct {
 		gid   int
 		value string
@@ -734,7 +749,7 @@ func TestUDSAuth_QueryGID(t *testing.T) {
 	}
 }
 
-func TestUDSAuth_QueryPID(t *testing.T) {
+func TestUDS_Auth_QueryPID(t *testing.T) {
 	tests := []struct {
 		pid   int
 		value string
@@ -758,5 +773,51 @@ func TestUDSAuth_QueryPID(t *testing.T) {
 		if !tc.err && match != tc.match {
 			t.Errorf("pid=%d value=%q: match=%v, want %v", tc.pid, tc.value, match, tc.match)
 		}
+	}
+}
+
+func TestUDS_ParseUDSOption(t *testing.T) {
+	tests := []struct {
+		input   string
+		path    string
+		group   string
+		mode    string
+		wantErr bool
+	}{
+		// Valid cases
+		{"/tmp/nats.sock", "/tmp/nats.sock", "", "", false},
+		{"/tmp/nats.sock;group=nats", "/tmp/nats.sock", "nats", "", false},
+		{"/tmp/nats.sock;mode=0660", "/tmp/nats.sock", "", "0660", false},
+		{"/tmp/nats.sock;group=nats;mode=0660", "/tmp/nats.sock", "nats", "0660", false},
+		{"/tmp/nats.sock;mode=0660;group=nats", "/tmp/nats.sock", "nats", "0660", false},
+		{"/path/with spaces/sock;group=123", "/path/with spaces/sock", "123", "", false},
+		// Error cases
+		{"", "", "", "", true},                  // empty string
+		{";group=nats", "", "", "", true},       // empty path
+		{"/tmp/sock;invalid", "", "", "", true}, // missing =
+		{"/tmp/sock;foo=bar", "", "", "", true}, // unknown option
+	}
+	for _, tc := range tests {
+		t.Run(tc.input, func(t *testing.T) {
+			opts, err := ParseUDSOption(tc.input)
+			if tc.wantErr {
+				if err == nil {
+					t.Errorf("expected error for input %q", tc.input)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if opts.Path != tc.path {
+				t.Errorf("path: got %q, want %q", opts.Path, tc.path)
+			}
+			if opts.Group != tc.group {
+				t.Errorf("group: got %q, want %q", opts.Group, tc.group)
+			}
+			if opts.Mode != tc.mode {
+				t.Errorf("mode: got %q, want %q", opts.Mode, tc.mode)
+			}
+		})
 	}
 }

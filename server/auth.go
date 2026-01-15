@@ -1156,7 +1156,7 @@ func (s *Server) processClientOrLeafAuthentication(c *client, opts *Options) (au
 
 		// TODO: Is lock here really required?
 		s.mu.RLock()
-		authResult, err := udsAuthenticatePeer(s.users, s.udsPeerCredQueries, peerCreds)
+		authResult, err := udsAuthenticatePeer(s.users, s.uds.peerCredentialQueries, peerCreds)
 		s.mu.RUnlock()
 
 		if err != nil {

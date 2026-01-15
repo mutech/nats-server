@@ -47,7 +47,7 @@ func runServerUDS(path string) *server.Server {
 	opts := DefaultTestOptions
 	opts.Port = -1
 	opts.DontListen = true
-	opts.UDSPath = path
+	opts.UDS.Path = path
 	opts.DisableShortFirstPing = true
 	s := RunServer(&opts)
 	s.ReadyForConnections(5 * time.Second)
