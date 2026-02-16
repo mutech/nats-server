@@ -144,6 +144,8 @@ const (
 	// Batch stream ops.
 	batchMsgOp
 	batchCommitMsgOp
+	// Consumer rest to specific starting sequence.
+	resetSeqOp
 )
 
 // raftGroups are controlled by the metagroup controller.
@@ -1937,6 +1939,48 @@ func (js *jetStream) applyMetaSnapshot(buf []byte, ru *recoveryUpdates, isRecove
 		}
 	}
 
+	// If we're not recovering, we need to check if we have any left-over streams or consumers that aren't
+	// tracked in our assignments. This could happen if we've restarted and recovered streams or consumers
+	// from disk, but then got sent a snapshot to catch up from the meta-leader.
+	if !isRecovering {
+		var deleteStreams []*stream
+		var deleteConsumers []*consumer
+		js.mu.RLock()
+		js.srv.accounts.Range(func(k, v any) bool {
+			a := v.(*Account)
+			a.mu.RLock()
+			jsa := a.js
+			a.mu.RUnlock()
+			if jsa == nil {
+				return true
+			}
+			accStreams := cc.streams[a.Name]
+			jsa.mu.RLock()
+			for _, mset := range jsa.streams {
+				stream := accStreams[mset.name()]
+				if stream == nil {
+					deleteStreams = append(deleteStreams, mset)
+					continue
+				}
+				for _, o := range mset.getPublicConsumers() {
+					if stream.consumers[o.name] == nil {
+						deleteConsumers = append(deleteConsumers, o)
+					}
+				}
+			}
+			jsa.mu.RUnlock()
+			return true
+		})
+		js.mu.RUnlock()
+
+		// Now delete all streams and consumers that we're not supposed to have based on the snapshot.
+		for _, mset := range deleteStreams {
+			mset.stop(true, false)
+		}
+		for _, o := range deleteConsumers {
+			o.deleteWithoutAdvisory()
+		}
+	}
 	return nil
 }
 
@@ -4498,6 +4542,8 @@ func (js *jetStream) processClusterUpdateStream(acc *Account, osa, sa *streamAss
 			s.Warnf("JetStream cluster detected stream remapping for '%s > %s' from %q to %q",
 				acc, cfg.Name, osa.Group.Name, sa.Group.Name)
 			mset.removeNode()
+			mset.signalMonitorQuit()
+			mset.monitorWg.Wait()
 			alreadyRunning, needsNode = false, true
 			// Make sure to clear from original.
 			js.mu.Lock()
@@ -4535,6 +4581,8 @@ func (js *jetStream) processClusterUpdateStream(acc *Account, osa, sa *streamAss
 		} else if numReplicas == 1 && alreadyRunning {
 			// We downgraded to R1. Make sure we cleanup the raft node and the stream monitor.
 			mset.removeNode()
+			mset.signalMonitorQuit()
+			mset.monitorWg.Wait()
 			// In case we need to shutdown the cluster specific subs, etc.
 			mset.mu.Lock()
 			// Stop responding to sync requests.
@@ -6127,6 +6175,39 @@ func (js *jetStream) applyConsumerEntries(o *consumer, ce *CommittedEntry, isLea
 					o.store.UpdateStarting(sseq - 1)
 				}
 				o.mu.Unlock()
+			case resetSeqOp:
+				o.mu.Lock()
+				var le = binary.LittleEndian
+				sseq := le.Uint64(buf[1:9])
+				reply := string(buf[9:])
+				o.resetLocalStartingSeq(sseq)
+				if o.store != nil {
+					o.store.Reset(sseq - 1)
+				}
+				// Cleanup messages that lost interest.
+				if o.retention == InterestPolicy {
+					if mset := o.mset; mset != nil {
+						o.mu.Unlock()
+						ss := mset.state()
+						o.checkStateForInterestStream(&ss)
+						o.mu.Lock()
+					}
+				}
+				// Recalculate pending, and re-trigger message delivery.
+				if !o.isLeader() {
+					o.mu.Unlock()
+				} else {
+					o.streamNumPending()
+					o.signalNewMessages()
+					s, a := o.srv, o.acc
+					o.mu.Unlock()
+					if reply != _EMPTY_ {
+						var resp = JSApiConsumerResetResponse{ApiResponse: ApiResponse{Type: JSApiConsumerResetResponseType}}
+						resp.ConsumerInfo = setDynamicConsumerInfoMetadata(o.info())
+						resp.ResetSeq = sseq
+						s.sendInternalAccountMsg(a, reply, s.jsonResponse(&resp))
+					}
+				}
 			case addPendingRequest:
 				o.mu.Lock()
 				if !o.isLeader() {
@@ -8511,26 +8592,25 @@ func (s *Server) jsClusteredConsumerRequest(ci *ClientInfo, acc *Account, subjec
 			maxc = selectedLimits.MaxConsumers
 		}
 		if maxc > 0 {
-			// Don't count DIRECTS.
-			total := 0
-			for ca := range js.consumerAssignmentsOrInflightSeq(acc.Name, stream) {
-				if ca.unsupported != nil {
-					continue
+			// If the consumer name is specified and we think it already exists, then
+			// we're likely updating an existing consumer, so don't count it. Otherwise
+			// we will incorrectly return NewJSMaximumConsumersLimitError for an update.
+			if oname == _EMPTY_ || js.consumerAssignmentOrInflight(acc.Name, stream, oname) == nil {
+				// Don't count DIRECTS.
+				total := 0
+				for ca := range js.consumerAssignmentsOrInflightSeq(acc.Name, stream) {
+					if ca.unsupported != nil {
+						continue
+					}
+					if ca.Config != nil && !ca.Config.Direct {
+						total++
+					}
 				}
-				// If the consumer name is specified and we think it already exists, then
-				// we're likely updating an existing consumer, so don't count it. Otherwise
-				// we will incorrectly return NewJSMaximumConsumersLimitError for an update.
-				if oname != _EMPTY_ && ca.Name == oname {
-					continue
+				if total >= maxc {
+					resp.Error = NewJSMaximumConsumersLimitError()
+					s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
+					return
 				}
-				if ca.Config != nil && !ca.Config.Direct {
-					total++
-				}
-			}
-			if total >= maxc {
-				resp.Error = NewJSMaximumConsumersLimitError()
-				s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
-				return
 			}
 		}
 	}

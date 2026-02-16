@@ -42,7 +42,6 @@ import (
 const (
 	JSPullRequestPendingMsgs  = "Nats-Pending-Messages"
 	JSPullRequestPendingBytes = "Nats-Pending-Bytes"
-	JSPullRequestWrongPinID   = "NATS/1.0 423 Nats-Wrong-Pin-Id\r\n\r\n"
 	JSPullRequestNatsPinId    = "Nats-Pin-Id"
 )
 
@@ -437,11 +436,13 @@ type consumer struct {
 	lss               *lastSeqSkipList
 	rlimit            *rate.Limiter
 	reqSub            *subscription
+	resetSub          *subscription
 	ackSub            *subscription
 	ackReplyT         string
 	ackSubj           string
 	nextMsgSubj       string
 	nextMsgReqs       *ipQueue[*nextMsgReq]
+	resetSubj         string
 	maxp              int
 	pblimit           int
 	maxpb             int
@@ -512,7 +513,7 @@ type consumer struct {
 	// Details described in ADR-42.
 
 	// currentPinId is the current nuid for the pinned consumer.
-	// If the  Consumer is running in `PriorityPinnedClient` mode, server will
+	// If the Consumer is running in `PriorityPinnedClient` mode, server will
 	// pick up a new nuid and assign it to first pending pull request.
 	currentPinId string
 	/// pinnedTtl is the remaining time before the current PinId expires.
@@ -1059,17 +1060,22 @@ func (mset *stream) addConsumerWithAssignment(config *ConsumerConfig, oname stri
 		return nil, NewJSConsumerDoesNotExistError()
 	}
 
-	// Check for any limits, if the config for the consumer sets a limit we check against that
-	// but if not we use the value from account limits, if account limits is more restrictive
-	// than stream config we prefer the account limits to handle cases where account limits are
-	// updated during the lifecycle of the stream
-	maxc := cfg.MaxConsumers
-	if maxc <= 0 || (selectedLimits.MaxConsumers > 0 && selectedLimits.MaxConsumers < maxc) {
-		maxc = selectedLimits.MaxConsumers
-	}
-	if maxc > 0 && mset.numPublicConsumers() >= maxc {
-		mset.mu.Unlock()
-		return nil, NewJSMaximumConsumersLimitError()
+	// If we're clustered we've already done this check, only do this if we're a standalone server.
+	// But if we're standalone, only enforce if we're not recovering, since the MaxConsumers could've
+	// been updated while we already had more consumers on disk.
+	if !s.JetStreamIsClustered() && s.standAloneMode() && !isRecovering {
+		// Check for any limits, if the config for the consumer sets a limit we check against that
+		// but if not we use the value from account limits, if account limits is more restrictive
+		// than stream config we prefer the account limits to handle cases where account limits are
+		// updated during the lifecycle of the stream
+		maxc := cfg.MaxConsumers
+		if maxc <= 0 || (selectedLimits.MaxConsumers > 0 && selectedLimits.MaxConsumers < maxc) {
+			maxc = selectedLimits.MaxConsumers
+		}
+		if maxc > 0 && mset.numPublicConsumers() >= maxc {
+			mset.mu.Unlock()
+			return nil, NewJSMaximumConsumersLimitError()
+		}
 	}
 
 	// Check on stream type conflicts with WorkQueues.
@@ -1272,6 +1278,7 @@ func (mset *stream) addConsumerWithAssignment(config *ConsumerConfig, oname stri
 	o.ackReplyT = fmt.Sprintf("%s.%%d.%%d.%%d.%%d.%%d", pre)
 	o.ackSubj = fmt.Sprintf("%s.*.*.*.*.*", pre)
 	o.nextMsgSubj = fmt.Sprintf(JSApiRequestNextT, mn, o.name)
+	o.resetSubj = fmt.Sprintf(JSApiConsumerResetT, mn, o.name)
 
 	// Check/update the inactive threshold
 	o.updateInactiveThreshold(&o.cfg)
@@ -1554,6 +1561,10 @@ func (o *consumer) setLeader(isLeader bool) {
 			o.mu.Unlock()
 			return
 		}
+		if o.resetSub, err = o.subscribeInternal(o.resetSubj, o.processResetReq); err != nil {
+			o.mu.Unlock()
+			return
+		}
 
 		// Check on flow control settings.
 		if o.cfg.FlowControl {
@@ -1673,8 +1684,9 @@ func (o *consumer) setLeader(isLeader bool) {
 		// ok if they are nil, we protect inside unsubscribe()
 		o.unsubscribe(o.ackSub)
 		o.unsubscribe(o.reqSub)
+		o.unsubscribe(o.resetSub)
 		o.unsubscribe(o.fcSub)
-		o.ackSub, o.reqSub, o.fcSub = nil, nil, nil
+		o.ackSub, o.reqSub, o.resetSub, o.fcSub = nil, nil, nil, nil
 		if o.infoSub != nil {
 			o.srv.sysUnsubscribe(o.infoSub)
 			o.infoSub = nil
@@ -1686,6 +1698,7 @@ func (o *consumer) setLeader(isLeader bool) {
 		} else if o.srv.gateway.enabled {
 			stopAndClearTimer(&o.gwdtmr)
 		}
+		o.unassignPinId()
 		// If we were the leader make sure to drain queued up acks.
 		if wasLeader {
 			o.ackMsgs.drain()
@@ -2607,6 +2620,78 @@ func (o *consumer) updateSkipped(seq uint64) {
 	var le = binary.LittleEndian
 	le.PutUint64(b[1:], seq)
 	o.propose(b[:])
+}
+
+func (o *consumer) resetStartingSeq(seq uint64, reply string) (uint64, bool, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	// Reset to a specific sequence, or back to the ack floor.
+	if seq == 0 {
+		seq = o.asflr + 1
+	} else if o.cfg.DeliverPolicy == DeliverAll {
+		// Always allowed.
+		goto VALID
+	} else if o.cfg.DeliverPolicy == DeliverByStartSequence {
+		// Only allowed if not going below what's configured.
+		if seq < o.cfg.OptStartSeq {
+			return 0, false, errors.New("below start seq")
+		}
+		goto VALID
+	} else if o.cfg.DeliverPolicy == DeliverByStartTime && o.mset != nil {
+		// Only allowed if not going below what's configured.
+		nseq := o.mset.store.GetSeqFromTime(*o.cfg.OptStartTime)
+		if seq < nseq {
+			return 0, false, errors.New("below start time")
+		}
+		goto VALID
+	} else {
+		return 0, false, errors.New("not allowed")
+	}
+
+VALID:
+	// Must be a minimum of 1.
+	if seq <= 0 {
+		seq = 1
+	}
+	o.resetLocalStartingSeq(seq)
+	// Clustered mode and R>1.
+	if o.node != nil {
+		b := make([]byte, 1+8+len(reply))
+		b[0] = byte(resetSeqOp)
+		var le = binary.LittleEndian
+		le.PutUint64(b[1:], seq)
+		copy(b[1+8:], reply)
+		o.propose(b[:])
+		return seq, false, nil
+	} else if o.store != nil {
+		o.store.Reset(seq - 1)
+		// Cleanup messages that lost interest.
+		if o.retention == InterestPolicy {
+			if mset := o.mset; mset != nil {
+				o.mu.Unlock()
+				ss := mset.state()
+				o.checkStateForInterestStream(&ss)
+				o.mu.Lock()
+			}
+		}
+
+		// Recalculate pending, and re-trigger message delivery.
+		o.streamNumPending()
+		o.signalNewMessages()
+		return seq, true, nil
+	}
+	return seq, false, nil
+}
+
+// Lock should be held.
+func (o *consumer) resetLocalStartingSeq(seq uint64) {
+	o.pending, o.rdc = nil, nil
+	o.rdq = nil
+	o.rdqi.Empty()
+	o.sseq, o.dseq = seq, 1
+	o.adflr, o.asflr = o.dseq-1, o.sseq-1
+	o.ldt, o.lat = time.Time{}, time.Time{}
 }
 
 func (o *consumer) loopAndForwardProposals(qch chan struct{}) {
@@ -3915,11 +4000,38 @@ func (o *consumer) setPinnedTimer(priorityGroup string) {
 	} else {
 		o.pinnedTtl = time.AfterFunc(o.cfg.PinnedTTL, func() {
 			o.mu.Lock()
-			o.currentPinId = _EMPTY_
+			// Skip if already unset.
+			if o.currentPinId == _EMPTY_ {
+				o.mu.Unlock()
+				return
+			}
+			o.unassignPinId()
 			o.sendUnpinnedAdvisoryLocked(priorityGroup, "timeout")
 			o.mu.Unlock()
 			o.signalNewMessages()
 		})
+	}
+}
+
+// Lock should be held.
+func (o *consumer) assignNewPinId(wr *waitingRequest) {
+	if wr.priorityGroup == nil || wr.priorityGroup.Group == _EMPTY_ {
+		return
+	}
+	o.currentPinId = nuid.Next()
+	o.pinnedTS = time.Now().UTC()
+	wr.priorityGroup.Id = o.currentPinId
+	o.setPinnedTimer(wr.priorityGroup.Group)
+	o.sendPinnedAdvisoryLocked(wr.priorityGroup.Group)
+}
+
+// Lock should be held.
+func (o *consumer) unassignPinId() {
+	o.currentPinId = _EMPTY_
+	o.pinnedTS = time.Time{}
+	if o.pinnedTtl != nil {
+		o.pinnedTtl.Stop()
+		o.pinnedTtl = nil
 	}
 }
 
@@ -3933,11 +4045,6 @@ func (o *consumer) nextWaiting(sz int) *waitingRequest {
 
 	// Check if server needs to assign a new pin id.
 	needNewPin := o.currentPinId == _EMPTY_ && o.cfg.PriorityPolicy == PriorityPinnedClient
-	// As long as we support only one priority group, we can capture  that group here and reuse it.
-	var priorityGroup string
-	if len(o.cfg.PriorityGroups) > 0 {
-		priorityGroup = o.cfg.PriorityGroups[0]
-	}
 
 	numCycled := 0
 	for wr := o.waiting.peek(); !o.waiting.isEmpty(); wr = o.waiting.peek() {
@@ -3971,15 +4078,12 @@ func (o *consumer) nextWaiting(sz int) *waitingRequest {
 		if wr.expires.IsZero() || time.Now().Before(wr.expires) {
 			if needNewPin {
 				if wr.priorityGroup.Id == _EMPTY_ {
-					o.currentPinId = nuid.Next()
-					o.pinnedTS = time.Now().UTC()
-					wr.priorityGroup.Id = o.currentPinId
-					o.setPinnedTimer(priorityGroup)
-
+					o.assignNewPinId(wr)
 				} else {
 					// There is pin id set, but not a matching one. Send a notification to the client and remove the request.
 					// Probably this is the old pin id.
-					o.outq.send(newJSPubMsg(wr.reply, _EMPTY_, _EMPTY_, []byte(JSPullRequestWrongPinID), nil, nil, 0))
+					hdr := fmt.Appendf(nil, "NATS/1.0 423 Nats-Wrong-Pin-Id\r\n%s: %d\r\n%s: %d\r\n\r\n", JSPullRequestPendingMsgs, wr.n, JSPullRequestPendingBytes, wr.b)
+					o.outq.send(newJSPubMsg(wr.reply, _EMPTY_, _EMPTY_, hdr, nil, nil, 0))
 					o.waiting.removeCurrent()
 					if o.node != nil {
 						o.removeClusterPendingRequest(wr.reply)
@@ -4000,7 +4104,8 @@ func (o *consumer) nextWaiting(sz int) *waitingRequest {
 					continue
 				} else {
 					// There is pin id set, but not a matching one. Send a notification to the client and remove the request.
-					o.outq.send(newJSPubMsg(wr.reply, _EMPTY_, _EMPTY_, []byte(JSPullRequestWrongPinID), nil, nil, 0))
+					hdr := fmt.Appendf(nil, "NATS/1.0 423 Nats-Wrong-Pin-Id\r\n%s: %d\r\n%s: %d\r\n\r\n", JSPullRequestPendingMsgs, wr.n, JSPullRequestPendingBytes, wr.b)
+					o.outq.send(newJSPubMsg(wr.reply, _EMPTY_, _EMPTY_, hdr, nil, nil, 0))
 					o.waiting.removeCurrent()
 					if o.node != nil {
 						o.removeClusterPendingRequest(wr.reply)
@@ -4012,9 +4117,13 @@ func (o *consumer) nextWaiting(sz int) *waitingRequest {
 
 			if o.cfg.PriorityPolicy == PriorityOverflow {
 				if wr.priorityGroup != nil &&
+					// If both limits are zero we don't cycle and the request will be fulfilled.
+					(wr.priorityGroup.MinPending > 0 || wr.priorityGroup.MinAckPending > 0) &&
 					// We need to check o.npc+1, because before calling nextWaiting, we do o.npc--
-					(wr.priorityGroup.MinPending > 0 && wr.priorityGroup.MinPending > o.npc+1 ||
-						wr.priorityGroup.MinAckPending > 0 && wr.priorityGroup.MinAckPending > int64(len(o.pending))) {
+					// If one OR the other limit is exceeded, we want to fulfill the request.
+					// This is an inverted check. For clarity, we check the positive condition and negate.
+					!((wr.priorityGroup.MinPending > 0 && wr.priorityGroup.MinPending <= o.npc+1) ||
+						(wr.priorityGroup.MinAckPending > 0 && wr.priorityGroup.MinAckPending <= int64(len(o.pending)))) {
 					o.waiting.cycle()
 					numCycled++
 					// We're done cycling through the requests.
@@ -4025,19 +4134,10 @@ func (o *consumer) nextWaiting(sz int) *waitingRequest {
 				}
 			}
 			if wr.acc.sl.HasInterest(wr.interest) {
-				if needNewPin {
-					o.sendPinnedAdvisoryLocked(priorityGroup)
-				}
 				return o.waiting.popOrPopAndRequeue(o.cfg.PriorityPolicy)
 			} else if time.Since(wr.received) < defaultGatewayRecentSubExpiration && (o.srv.leafNodeEnabled || o.srv.gateway.enabled) {
-				if needNewPin {
-					o.sendPinnedAdvisoryLocked(priorityGroup)
-				}
 				return o.waiting.popOrPopAndRequeue(o.cfg.PriorityPolicy)
 			} else if o.srv.gateway.enabled && o.srv.hasGatewayInterest(wr.acc.Name, wr.interest) {
-				if needNewPin {
-					o.sendPinnedAdvisoryLocked(priorityGroup)
-				}
 				return o.waiting.popOrPopAndRequeue(o.cfg.PriorityPolicy)
 			}
 		} else {
@@ -4134,6 +4234,42 @@ func (o *consumer) processNextMsgReq(_ *subscription, c *client, _ *Account, _, 
 	o.nextMsgReqs.push(newNextMsgReq(reply, copyBytes(msg)))
 }
 
+// processResetReq will reset a consumer to a new starting sequence.
+func (o *consumer) processResetReq(_ *subscription, c *client, a *Account, _, reply string, rmsg []byte) {
+	if reply == _EMPTY_ {
+		return
+	}
+
+	s := o.srv
+	var resp = JSApiConsumerResetResponse{ApiResponse: ApiResponse{Type: JSApiConsumerResetResponseType}}
+
+	hdr, msg := c.msgParts(rmsg)
+	if errorOnRequiredApiLevel(hdr) {
+		resp.Error = NewJSRequiredApiLevelError()
+		s.sendInternalAccountMsg(a, reply, s.jsonResponse(&resp))
+		return
+	}
+
+	// An empty message resets back to the ack floor, otherwise a custom sequence can be used.
+	var req JSApiConsumerResetRequest
+	if len(msg) > 0 {
+		if err := json.Unmarshal(msg, &req); err != nil {
+			resp.Error = NewJSInvalidJSONError(err)
+			s.sendInternalAccountMsg(a, reply, s.jsonResponse(&resp))
+			return
+		}
+	}
+	resetSeq, canRespond, err := o.resetStartingSeq(req.Seq, reply)
+	if err != nil {
+		resp.Error = NewJSConsumerInvalidResetError(err)
+		s.sendInternalAccountMsg(a, reply, s.jsonResponse(&resp))
+	} else if canRespond {
+		resp.ConsumerInfo = setDynamicConsumerInfoMetadata(o.info())
+		resp.ResetSeq = resetSeq
+		s.sendInternalAccountMsg(a, reply, s.jsonResponse(&resp))
+	}
+}
+
 func (o *consumer) processNextMsgRequest(reply string, msg []byte) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -4195,15 +4331,7 @@ func (o *consumer) processNextMsgRequest(reply string, msg []byte) {
 			sendErr(400, "Bad Request - Priority Group missing")
 			return
 		}
-
-		found := false
-		for _, group := range o.cfg.PriorityGroups {
-			if group == priorityGroup.Group {
-				found = true
-				break
-			}
-		}
-		if !found {
+		if !slices.Contains(o.cfg.PriorityGroups, priorityGroup.Group) {
 			sendErr(400, "Bad Request - Invalid Priority Group")
 			return
 		}
@@ -6090,9 +6218,11 @@ func (o *consumer) stopWithFlags(dflag, sdflag, doSignal, advisory bool) error {
 	o.active = false
 	o.unsubscribe(o.ackSub)
 	o.unsubscribe(o.reqSub)
+	o.unsubscribe(o.resetSub)
 	o.unsubscribe(o.fcSub)
 	o.ackSub = nil
 	o.reqSub = nil
+	o.resetSub = nil
 	o.fcSub = nil
 	if o.infoSub != nil {
 		o.srv.sysUnsubscribe(o.infoSub)

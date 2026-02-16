@@ -427,7 +427,8 @@ type stream struct {
 	cisrun atomic.Bool // Indicates one checkInterestState is already running.
 
 	// Mirror
-	mirror *sourceInfo
+	mirror              *sourceInfo
+	mirrorConsumerSetup *time.Timer
 
 	// Sources
 	sources              map[string]*sourceInfo
@@ -2106,10 +2107,6 @@ func (jsa *jsAccount) configUpdateCheck(old, new *StreamConfig, s *Server, pedan
 	if cfg.Name != old.Name {
 		return nil, NewJSStreamInvalidConfigError(fmt.Errorf("stream configuration name must match original"))
 	}
-	// Can't change MaxConsumers for now.
-	if cfg.MaxConsumers != old.MaxConsumers {
-		return nil, NewJSStreamInvalidConfigError(fmt.Errorf("stream configuration update can not change MaxConsumers"))
-	}
 	// Can't change storage types.
 	if cfg.Storage != old.Storage {
 		return nil, NewJSStreamInvalidConfigError(fmt.Errorf("stream configuration update can not change storage type"))
@@ -3108,7 +3105,8 @@ func (mset *stream) scheduleSetupMirrorConsumerRetry() {
 	// Add some jitter.
 	next += time.Duration(rand.Intn(int(100*time.Millisecond))) + 100*time.Millisecond
 
-	time.AfterFunc(next, func() {
+	stopAndClearTimer(&mset.mirrorConsumerSetup)
+	mset.mirrorConsumerSetup = time.AfterFunc(next, func() {
 		mset.mu.Lock()
 		mset.setupMirrorConsumer()
 		mset.mu.Unlock()
