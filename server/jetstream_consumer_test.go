@@ -25,7 +25,8 @@ import (
 	"fmt"
 	"math/rand"
 	"net/url"
-	"os"
+	os "os"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"slices"
@@ -11231,4 +11232,194 @@ func TestJetStreamConsumerResetToSequenceConstraintOnStartTime(t *testing.T) {
 	require_Len(t, len(msgs), 1)
 	require_Equal(t, string(msgs[0].Data), "msg3")
 	require_NoError(t, msgs[0].AckSync())
+}
+
+// https://github.com/nats-io/nats-server/issues/7847
+func TestJetStreamConsumerLegacyDurableCreateSetsConsumerName(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	cfg := &nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+	}
+	_, err := js.AddStream(cfg)
+	require_NoError(t, err)
+
+	cc := CreateConsumerRequest{
+		Stream: "TEST",
+		Config: ConsumerConfig{
+			Durable:   "CONSUMER",
+			AckPolicy: AckExplicit,
+			Replicas:  1,
+		},
+		Action: ActionCreate,
+	}
+	req, err := json.Marshal(cc)
+	require_NoError(t, err)
+
+	msg, err := nc.Request("$JS.API.CONSUMER.CREATE.TEST.CONSUMER", req, time.Second)
+	require_NoError(t, err)
+	var resp JSApiConsumerCreateResponse
+	require_NoError(t, json.Unmarshal(msg.Data, &resp))
+	require_True(t, resp.Error == nil)
+	require_Equal(t, resp.Config.Durable, "CONSUMER")
+	require_Equal(t, resp.Config.Name, "CONSUMER")
+
+	msg, err = nc.Request("$JS.API.CONSUMER.DURABLE.CREATE.TEST.CONSUMER", req, time.Second)
+	require_NoError(t, err)
+	resp = JSApiConsumerCreateResponse{}
+	require_NoError(t, json.Unmarshal(msg.Data, &resp))
+	require_True(t, resp.Error == nil)
+	require_Equal(t, resp.Config.Durable, "CONSUMER")
+	require_Equal(t, resp.Config.Name, "CONSUMER")
+}
+
+// https://github.com/nats-io/nats-server/issues/7852
+func TestJetStreamConsumerSingleFilterSubjectInFilterSubjects(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+	})
+	require_NoError(t, err)
+
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Durable:        "CONSUMER",
+		FilterSubjects: []string{"foo"},
+	})
+	require_NoError(t, err)
+
+	mset, err := s.globalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+	o := mset.lookupConsumer("CONSUMER")
+	require_NotNil(t, o)
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+
+	// Should not initialize the sublist, as that will make us use LoadNextMsgMulti versus LoadNextMsg.
+	require_Len(t, len(o.subjf), 1)
+	require_True(t, o.filters == nil)
+}
+
+func TestJetStreamConsumerReconcileConsumerAfterStreamDataLoss(t *testing.T) {
+	test := func(t *testing.T, totalMsgs int) {
+		storeDir := t.TempDir()
+		conf := createConfFile(t, []byte(fmt.Sprintf(`
+		listen: 127.0.0.1:-1
+		jetstream: {store_dir: %q}
+	`, storeDir)))
+
+		s, _ := RunServerWithConfig(conf)
+		defer s.Shutdown()
+
+		nc, js := jsClientConnect(t, s)
+		defer nc.Close()
+
+		_, err := js.AddStream(&nats.StreamConfig{
+			Name:     "TEST",
+			Subjects: []string{"foo"},
+		})
+		require_NoError(t, err)
+
+		// Publish a few messages.
+		for range totalMsgs {
+			_, err = js.Publish("foo", nil)
+			require_NoError(t, err)
+		}
+
+		_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+			Durable:   "DURABLE",
+			AckPolicy: nats.AckExplicitPolicy,
+		})
+		require_NoError(t, err)
+
+		sub, err := js.PullSubscribe(_EMPTY_, "CONSUMER", nats.BindStream("TEST"))
+		require_NoError(t, err)
+		defer sub.Drain()
+
+		// Consume all available messages.
+		msgs, err := sub.Fetch(totalMsgs, nats.MaxWait(200*time.Millisecond))
+		require_NoError(t, err)
+		require_Len(t, len(msgs), totalMsgs)
+		for _, msg := range msgs {
+			require_NoError(t, msg.AckSync())
+		}
+
+		// Confirm the consumer info reports all messages as delivered and acked.
+		lseq := uint64(totalMsgs)
+		ci, err := js.ConsumerInfo("TEST", "CONSUMER")
+		require_NoError(t, err)
+		require_Equal(t, ci.NumPending, 0)
+		require_Equal(t, ci.NumAckPending, 0)
+		require_Equal(t, ci.Delivered.Stream, lseq)
+		require_Equal(t, ci.AckFloor.Stream, lseq)
+		require_Equal(t, ci.Delivered.Consumer, lseq)
+
+		// Shut down the server and manually remove or truncate the message blocks, simulating data loss.
+		mset, err := s.globalAccount().lookupStream("TEST")
+		require_NoError(t, err)
+		fs := mset.store.(*fileStore)
+		blk := filepath.Join(fs.fcfg.StoreDir, msgDir, "1.blk")
+		index := filepath.Join(fs.fcfg.StoreDir, msgDir, streamStreamStateFile)
+		nc.Close()
+		s.Shutdown()
+		if totalMsgs > 1 {
+			stat, err := os.Stat(blk)
+			require_NoError(t, err)
+			require_NoError(t, os.Truncate(blk, stat.Size()/2+1))
+		} else {
+			require_NoError(t, os.Remove(blk))
+		}
+		require_NoError(t, os.Remove(index))
+
+		// Restart the server and reconnect.
+		s, _ = RunServerWithConfig(conf)
+		defer s.Shutdown()
+		nc, js = jsClientConnect(t, s)
+		defer nc.Close()
+
+		// Publish another message. Due to the simulated data loss, the stream sequence should continue
+		// counting after truncating the corrupted data.
+		pubAck, err := js.Publish("foo", nil)
+		require_NoError(t, err)
+		require_Equal(t, pubAck.Sequence, lseq)
+
+		sub, err = js.PullSubscribe(_EMPTY_, "CONSUMER", nats.BindStream("TEST"))
+		require_NoError(t, err)
+		defer sub.Drain()
+
+		// The consumer should be able to consume above message.
+		// Previously the consumer state would not be reconciled and would not be able to consume the message.
+		msgs, err = sub.Fetch(1, nats.MaxWait(200*time.Millisecond))
+		require_NoError(t, err)
+		require_Len(t, len(msgs), 1)
+		msg := msgs[0]
+		meta, err := msg.Metadata()
+		require_NoError(t, err)
+		require_Equal(t, meta.Sequence.Stream, lseq)
+		require_NoError(t, msg.AckSync())
+
+		// Confirm the consumer info reports all messages as delivered and acked.
+		// But the delivered sequence shouldn't be reset and still move monotonically.
+		ci, err = js.ConsumerInfo("TEST", "CONSUMER")
+		require_NoError(t, err)
+		require_Equal(t, ci.NumPending, 0)
+		require_Equal(t, ci.NumAckPending, 0)
+		require_Equal(t, ci.Delivered.Stream, lseq)
+		require_Equal(t, ci.AckFloor.Stream, lseq)
+		require_Equal(t, ci.Delivered.Consumer, lseq+1)
+	}
+
+	for _, totalMsgs := range []int{1, 2} {
+		t.Run(fmt.Sprint(totalMsgs), func(t *testing.T) { test(t, totalMsgs) })
+	}
 }

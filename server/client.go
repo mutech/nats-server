@@ -4760,6 +4760,10 @@ func (c *client) processServiceImport(si *serviceImport, acc *Account, msg []byt
 			}
 		} else if c.kind != LEAF || c.pa.hdr < 0 || len(sliceHeader(ClientInfoHdr, msg[:c.pa.hdr])) == 0 {
 			ci = c.getClientInfo(share)
+			// Fast batch requires knowledge of the original reply subject.
+			if bytes.HasSuffix(c.pa.reply, []byte(FastBatchSuffix)) {
+				ci.Reply = bytesToString(c.pa.reply)
+			}
 			// If we did not share but the imports destination is the system account add in the server and cluster info.
 			if !share && isSysImport {
 				c.addServerAndClusterInfo(ci)

@@ -747,7 +747,7 @@ func TestJetStreamClusterFirstSeqMismatch(t *testing.T) {
 	nl.Shutdown()
 
 	time.Sleep(500 * time.Millisecond)
-	node.InstallSnapshot(mset.stateSnapshot())
+	node.InstallSnapshot(mset.stateSnapshot(), false)
 	time.Sleep(3500 * time.Millisecond)
 
 	c.restartServer(nl)
@@ -1535,7 +1535,7 @@ func TestJetStreamClusterParallelStreamCreation(t *testing.T) {
 	require_NoError(t, err)
 	node := mset.raftNode()
 	require_NotNil(t, node)
-	node.InstallSnapshot(mset.stateSnapshot())
+	node.InstallSnapshot(mset.stateSnapshot(), false)
 
 	nl = c.restartServer(nl)
 	c.waitOnStreamCurrent(nl, globalAccountName, "TEST")
@@ -3260,7 +3260,7 @@ func TestJetStreamClusterInterestBasedStreamAndConsumerSnapshots(t *testing.T) {
 
 	n := o.raftNode()
 	require_NotNil(t, n)
-	require_NoError(t, n.InstallSnapshot(snap))
+	require_NoError(t, n.InstallSnapshot(snap, false))
 
 	// Now restart the downed server.
 	s = c.restartServer(s)
@@ -3715,7 +3715,7 @@ func TestJetStreamClusterConsumerAckFloorDrift(t *testing.T) {
 		// Also snapshot to remove any raft entries that could affect it.
 		snap, err := o.store.EncodedState()
 		require_NoError(t, err)
-		require_NoError(t, o.raftNode().InstallSnapshot(snap))
+		require_NoError(t, o.raftNode().InstallSnapshot(snap, false))
 	}
 
 	cl := c.consumerLeader(globalAccountName, "TEST", "C")
@@ -3932,7 +3932,7 @@ func TestJetStreamClusterStreamNodeShutdownBugOnStop(t *testing.T) {
 	require_NoError(t, err)
 	node := mset.raftNode()
 	require_NotNil(t, node)
-	node.InstallSnapshot(mset.stateSnapshot())
+	node.InstallSnapshot(mset.stateSnapshot(), false)
 	// Stop the stream
 	mset.stop(false, false)
 	node.WaitForStop()
@@ -5302,7 +5302,7 @@ func TestJetStreamClusterStreamFailTrackingSnapshots(t *testing.T) {
 	require_NoError(t, err)
 	node := mset.raftNode()
 	require_NotNil(t, node)
-	node.InstallSnapshot(mset.stateSnapshot())
+	node.InstallSnapshot(mset.stateSnapshot(), false)
 
 	// Now restart nl
 	nl = c.restartServer(nl)
@@ -6446,6 +6446,64 @@ func TestJetStreamClusterAccountFileStoreLimits(t *testing.T) {
 	}
 }
 
+func TestJetStreamClusterTieredReservationConsistency(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, cjs := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	for _, replicas := range []int{1, 3} {
+		subj := fmt.Sprintf("R%d", replicas)
+		maxBytes := int64(1)
+		if replicas > 1 {
+			maxBytes = 10
+		}
+		_, err := cjs.AddStream(&nats.StreamConfig{
+			Name:      subj,
+			Replicas:  replicas,
+			Storage:   nats.FileStorage,
+			Retention: nats.LimitsPolicy,
+			MaxBytes:  maxBytes,
+		})
+		require_NoError(t, err)
+	}
+	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+		return checkState(t, c, globalAccountName, "R3")
+	})
+
+	sl := c.streamLeader(globalAccountName, "R1")
+	_, js, jsa := sl.globalAccount().getJetStreamFromAccount()
+
+	js.mu.RLock()
+	defer js.mu.RUnlock()
+	jsa.mu.RLock()
+	defer jsa.mu.RUnlock()
+
+	cfg := &StreamConfig{Storage: FileStorage}
+
+	// No tier, R1: 1, R3: 10*R
+	tier := _EMPTY_
+	require_Equal(t, jsa.tieredReservation(tier, cfg), 31)
+	streams, reservation := js.tieredStreamAndReservationCount(globalAccountName, tier, cfg)
+	require_Equal(t, streams, 2)
+	require_Equal(t, reservation, 31)
+
+	// R1 tier, R1: 1
+	tier, cfg.Replicas = "R1", 1
+	require_Equal(t, jsa.tieredReservation(tier, cfg), 1)
+	streams, reservation = js.tieredStreamAndReservationCount(globalAccountName, tier, cfg)
+	require_Equal(t, streams, 1)
+	require_Equal(t, reservation, 1)
+
+	// R3 tier, R3: 10
+	tier, cfg.Replicas = "R3", 3
+	require_Equal(t, jsa.tieredReservation(tier, cfg), 10)
+	streams, reservation = js.tieredStreamAndReservationCount(globalAccountName, tier, cfg)
+	require_Equal(t, streams, 1)
+	require_Equal(t, reservation, 10)
+}
+
 func TestJetStreamClusterCorruptMetaSnapshot(t *testing.T) {
 	c := createJetStreamClusterExplicit(t, "R3S", 3)
 	defer c.shutdown()
@@ -7146,9 +7204,9 @@ func TestJetStreamClusterStreamRescaleCatchup(t *testing.T) {
 				}
 				sjs := s.getJetStream()
 				n := sjs.getMetaGroup()
-				snap, err := sjs.metaSnapshot()
+				snap, _, _, err := sjs.metaSnapshot()
 				require_NoError(t, err)
-				require_NoError(t, n.InstallSnapshot(snap))
+				require_NoError(t, n.InstallSnapshot(snap, false))
 			}
 		}
 
@@ -7373,9 +7431,9 @@ func TestJetStreamClusterConsumerRescaleCatchup(t *testing.T) {
 				}
 				sjs := s.getJetStream()
 				n := sjs.getMetaGroup()
-				snap, err := sjs.metaSnapshot()
+				snap, _, _, err := sjs.metaSnapshot()
 				require_NoError(t, err)
-				require_NoError(t, n.InstallSnapshot(snap))
+				require_NoError(t, n.InstallSnapshot(snap, false))
 			}
 		}
 
@@ -7872,4 +7930,187 @@ func TestJetStreamClusterStreamUpdateMaxConsumersLimit(t *testing.T) {
 			t.Run(fmt.Sprintf("R%d/%s", replicas, desc), func(t *testing.T) { test(t, replicas, remove) })
 		}
 	}
+}
+
+func TestJetStreamClusterScaleDownWaitsForMonitorRoutineQuit(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	// Create R3 stream and consumer.
+	scfg := &nats.StreamConfig{Name: "TEST", Subjects: []string{"foo"}, Replicas: 3}
+	ccfg := &nats.ConsumerConfig{Name: "CONSUMER", Replicas: 3}
+	_, err := js.AddStream(scfg)
+	require_NoError(t, err)
+	_, err = js.AddConsumer("TEST", ccfg)
+	require_NoError(t, err)
+	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+		for _, s := range c.servers {
+			sjs := s.getJetStream()
+			if sjs.streamAssignment(globalAccountName, "TEST") == nil {
+				return errors.New("stream not found")
+			}
+			if sjs.consumerAssignment(globalAccountName, "TEST", "CONSUMER") == nil {
+				return errors.New("consumer not found")
+			}
+		}
+		return nil
+	})
+
+	cf := c.randomNonConsumerLeader(globalAccountName, "TEST", "CONSUMER")
+	require_NotNil(t, cf)
+	mset, err := cf.globalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+	o := mset.lookupConsumer("CONSUMER")
+	require_NotNil(t, o)
+
+	// Increment the wait group for this test to confirm the right ordering.
+	o.mu.Lock()
+	inMonitor := o.inMonitor
+	wg := &o.monitorWg
+	wg.Add(1)
+	o.mu.Unlock()
+	require_True(t, inMonitor)
+
+	// The monitor routine should stop.
+	ccfg.Replicas = 1
+	_, err = js.UpdateConsumer("TEST", ccfg)
+	require_NoError(t, err)
+	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+		o.mu.RLock()
+		defer o.mu.RUnlock()
+		if o.inMonitor {
+			return errors.New("consumer still in monitor")
+		}
+		return nil
+	})
+
+	// The consumer itself should still exist.
+	require_NotNil(t, mset.lookupConsumer("CONSUMER"))
+
+	// Simulate the monitor routine being done now and the consumer being removed.
+	wg.Done()
+	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+		if mset.lookupConsumer("CONSUMER") != nil {
+			return errors.New("consumer still exists")
+		}
+		return nil
+	})
+
+	sf := c.randomNonStreamLeader(globalAccountName, "TEST")
+	require_NotNil(t, sf)
+	mset, err = sf.globalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+
+	// Increment the wait group for this test to confirm the right ordering.
+	mset.mu.Lock()
+	inMonitor = mset.inMonitor
+	wg = &mset.monitorWg
+	wg.Add(1)
+	mset.mu.Unlock()
+	require_True(t, inMonitor)
+
+	// The monitor routine should stop.
+	scfg.Replicas = 1
+	_, err = js.UpdateStream(scfg)
+	require_NoError(t, err)
+	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+		mset.mu.RLock()
+		defer mset.mu.RUnlock()
+		if mset.inMonitor {
+			return errors.New("stream still in monitor")
+		}
+		return nil
+	})
+
+	// The stream itself should still exist.
+	_, err = sf.globalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+
+	// Simulate the monitor routine being done now and the stream being removed.
+	wg.Done()
+	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+		_, err = sf.globalAccount().lookupStream("TEST")
+		if !errors.Is(err, NewJSStreamNotFoundError()) {
+			return errors.New("stream still exists")
+		}
+		return nil
+	})
+}
+
+func TestJetStreamClusterConsumerRemapWaitsForMonitorRoutineQuit(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	// Create R3 stream and consumer.
+	scfg := &nats.StreamConfig{Name: "TEST", Subjects: []string{"foo"}, Replicas: 3}
+	ccfg := &nats.ConsumerConfig{Name: "CONSUMER", Replicas: 3}
+	_, err := js.AddStream(scfg)
+	require_NoError(t, err)
+	_, err = js.AddConsumer("TEST", ccfg)
+	require_NoError(t, err)
+	ml := c.leader()
+	sjs, cc := ml.getJetStreamCluster()
+	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+		if sjs.streamAssignment(globalAccountName, "TEST") == nil {
+			return errors.New("stream not found")
+		}
+		if sjs.consumerAssignment(globalAccountName, "TEST", "CONSUMER") == nil {
+			return errors.New("consumer not found")
+		}
+		return nil
+	})
+
+	mset, err := ml.globalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+	o := mset.lookupConsumer("CONSUMER")
+	require_NotNil(t, o)
+
+	// Increment the wait group for this test to confirm the right ordering.
+	o.mu.Lock()
+	inMonitor := o.inMonitor
+	wg := &o.monitorWg
+	wg.Add(1)
+	rn := o.node
+	o.mu.Unlock()
+	require_True(t, inMonitor)
+
+	// Simulate a consumer Raft group remapping that has been collapsed down into just a single update.
+	// Instead of one update to R1 and then to R3, it's just one update straight to the new R3 group.
+	ca := sjs.consumerAssignment(globalAccountName, "TEST", "CONSUMER")
+	require_NotNil(t, ca)
+	cca := ca.copyGroup()
+	cca.Group.Name = groupNameForConsumer(cca.Group.Peers, cca.Group.Storage)
+	require_NoError(t, cc.meta.Propose(encodeAddConsumerAssignment(cca)))
+
+	// The monitor routine should stop.
+	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+		o.mu.RLock()
+		defer o.mu.RUnlock()
+		if o.inMonitor {
+			return errors.New("consumer still in monitor")
+		}
+		return nil
+	})
+
+	// The previous Raft node should be stopped.
+	require_Equal(t, rn.State(), Closed)
+
+	// Simulate the monitor routine being done now and the new monitor routine being started.
+	wg.Done()
+	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+		o.mu.RLock()
+		defer o.mu.RUnlock()
+		if o.node == nil {
+			return errors.New("consumer has no Raft node yet")
+		} else if !o.inMonitor {
+			return errors.New("consumer monitor not started")
+		}
+		return nil
+	})
 }
