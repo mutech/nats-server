@@ -73,9 +73,9 @@ func TestWSGet(t *testing.T) {
 
 	for _, test := range []struct {
 		name   string
-		pos    int
-		needed int
-		newpos int
+		pos    uint64
+		needed uint64
+		newpos uint64
 		trmax  int
 		result string
 		reterr bool
@@ -410,6 +410,7 @@ func TestWSReadUncompressedFrames(t *testing.T) {
 
 func TestWSReadCompressedFrames(t *testing.T) {
 	c, ri, tr := testWSSetupForRead()
+	c.ws.compress = true
 	uncompressed := []byte("this is the uncompress data")
 	wsmsg1 := testWSCreateClientMsg(wsBinaryMessage, 1, true, true, uncompressed)
 	rb := append([]byte(nil), wsmsg1...)
@@ -477,6 +478,7 @@ func TestWSReadCompressedFrames(t *testing.T) {
 
 func TestWSReadCompressedFrameCorrupted(t *testing.T) {
 	c, ri, tr := testWSSetupForRead()
+	c.ws.compress = true
 	uncompressed := []byte("this is the uncompress data")
 	wsmsg1 := testWSCreateClientMsg(wsBinaryMessage, 1, true, true, uncompressed)
 	copy(wsmsg1[10:], []byte{1, 2, 3, 4})
@@ -797,23 +799,20 @@ func TestWSCloseFrameWithPartialOrInvalid(t *testing.T) {
 	// Make the io reader return the rest of the frame
 	tr.buf = closeMsg[1:]
 	bufs, err = c.wsRead(ri, tr, closeFirtByte[:])
-	// It is expected that wsRead returns io.EOF on processing a close.
-	if err != io.EOF {
+	if err == nil || !strings.Contains(err.Error(), "close frame payload cannot be 1 byte") {
 		t.Fatalf("Unexpected error: %v", err)
 	}
 	if n := len(bufs); n != 0 {
 		t.Fatalf("Unexpected buffer returned: %v", n)
 	}
-	// Since no status was received, the server will send a close frame without
-	// status code nor payload.
 	c.mu.Lock()
 	nb, _ = c.collapsePtoNB()
 	c.mu.Unlock()
 	if n := len(nb); n == 0 {
 		t.Fatalf("Expected buffers, got %v", n)
 	}
-	if expected := 2; expected != len(nb[0]) {
-		t.Fatalf("Expected buffer to be %v bytes long, got %v", expected, len(nb[0]))
+	if len(nb[0]) < 4 {
+		t.Fatalf("Expected buffer to be at least 4 bytes long, got %v", len(nb[0]))
 	}
 	b = nb[0][0]
 	if b&wsFinalBit == 0 {
@@ -821,6 +820,36 @@ func TestWSCloseFrameWithPartialOrInvalid(t *testing.T) {
 	}
 	if b&byte(wsCloseMessage) == 0 {
 		t.Fatalf("Should have been a CLOSE, it wasn't: %v", b)
+	}
+	if status := binary.BigEndian.Uint16(nb[0][2:4]); status != wsCloseStatusProtocolError {
+		t.Fatalf("Expected status to be %v, got %v", wsCloseStatusProtocolError, status)
+	}
+
+	// Now test close with invalid status code.
+	c, ri, tr = testWSSetupForRead()
+	payload = make([]byte, 2)
+	binary.BigEndian.PutUint16(payload, wsCloseStatusNoStatusReceived)
+	closeMsg = testWSCreateClientMsg(wsCloseMessage, 1, true, false, payload)
+	closeFirtByte = []byte{closeMsg[0]}
+	tr.buf = closeMsg[1:]
+	bufs, err = c.wsRead(ri, tr, closeFirtByte[:])
+	if err == nil || !strings.Contains(err.Error(), "invalid close status code") {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if n := len(bufs); n != 0 {
+		t.Fatalf("Unexpected buffer returned: %v", n)
+	}
+	c.mu.Lock()
+	nb, _ = c.collapsePtoNB()
+	c.mu.Unlock()
+	if n := len(nb); n == 0 {
+		t.Fatalf("Expected buffers, got %v", n)
+	}
+	if len(nb[0]) < 4 {
+		t.Fatalf("Expected buffer to be at least 4 bytes long, got %v", len(nb[0]))
+	}
+	if status := binary.BigEndian.Uint16(nb[0][2:4]); status != wsCloseStatusProtocolError {
+		t.Fatalf("Expected status to be %v, got %v", wsCloseStatusProtocolError, status)
 	}
 }
 
@@ -918,62 +947,142 @@ func TestWSReadErrors(t *testing.T) {
 		cframe func() []byte
 		err    string
 		nbufs  int
+		setup  func(*client)
+		verify func(*testing.T, *wsReadInfo)
 	}{
 		{
-			func() []byte {
+			cframe: func() []byte {
 				msg := testWSCreateClientMsg(wsBinaryMessage, 1, true, false, []byte("hello"))
 				msg[1] &= ^byte(wsMaskBit)
 				return msg
 			},
-			"mask bit missing", 1,
+			err: "mask bit missing", nbufs: 1,
 		},
 		{
-			func() []byte {
+			cframe: func() []byte {
 				return testWSCreateClientMsg(wsPingMessage, 1, true, false, make([]byte, 200))
 			},
-			"control frame length bigger than maximum allowed", 1,
+			err: "control frame length bigger than maximum allowed", nbufs: 1,
 		},
 		{
-			func() []byte {
+			cframe: func() []byte {
 				return testWSCreateClientMsg(wsPingMessage, 1, false, false, []byte("hello"))
 			},
-			"control frame does not have final bit set", 1,
+			err: "control frame does not have final bit set", nbufs: 1,
 		},
 		{
-			func() []byte {
+			cframe: func() []byte {
 				frag1 := testWSCreateClientMsg(wsBinaryMessage, 1, false, false, []byte("frag1"))
 				newMsg := testWSCreateClientMsg(wsBinaryMessage, 1, true, false, []byte("new message"))
 				all := append([]byte(nil), frag1...)
 				all = append(all, newMsg...)
 				return all
 			},
-			"new message started before final frame for previous message was received", 2,
+			err: "new message started before final frame for previous message was received", nbufs: 2,
 		},
 		{
-			func() []byte {
+			cframe: func() []byte {
 				frame := testWSCreateClientMsg(wsBinaryMessage, 1, true, false, []byte("frame"))
 				frag := testWSCreateClientMsg(wsBinaryMessage, 2, false, false, []byte("continuation"))
 				all := append([]byte(nil), frame...)
 				all = append(all, frag...)
 				return all
 			},
-			"invalid continuation frame", 2,
+			err: "invalid continuation frame", nbufs: 2,
 		},
 		{
-			func() []byte {
-				return testWSCreateClientMsg(wsBinaryMessage, 2, false, true, []byte("frame"))
+			cframe: func() []byte {
+				return testWSCreateClientMsg(wsBinaryMessage, 2, false, false, []byte("frame"))
 			},
-			"invalid continuation frame", 1,
+			err: "invalid continuation frame", nbufs: 1,
 		},
 		{
-			func() []byte {
-				return testWSCreateClientMsg(99, 1, false, false, []byte("hello"))
+			cframe: func() []byte {
+				return testWSCreateClientMsg(11, 1, false, false, []byte("hello"))
 			},
-			"unknown opcode", 1,
+			err: "unknown opcode", nbufs: 1,
+		},
+		{
+			cframe: func() []byte {
+				msg := testWSCreateClientMsg(wsBinaryMessage, 1, true, false, nil)
+				msg = append(msg, 0, 0, 0, 0)
+				msg[1] = 127 | wsMaskBit
+				binary.BigEndian.PutUint64(msg[2:], uint64(1)<<63)
+				return msg
+			},
+			err: "invalid 64-bit payload length", nbufs: 1,
+		},
+		{
+			cframe: func() []byte {
+				return testWSCreateClientMsg(wsBinaryMessage, 1, true, true, []byte("compressed"))
+			},
+			err: "compressed frame received without negotiated permessage-deflate", nbufs: 1,
+		},
+		{
+			cframe: func() []byte {
+				frame := testWSCreateClientMsg(wsBinaryMessage, 1, false, false, make([]byte, 32))
+				frame[0] |= wsRsv1Bit
+				return frame
+			},
+			err: ErrMaxPayload.Error(), nbufs: 1,
+			setup: func(c *client) {
+				atomic.StoreInt32(&c.mpay, 16)
+				c.ws.compress = true
+			},
+			verify: func(t *testing.T, ri *wsReadInfo) {
+				if !ri.fs {
+					t.Fatal("Expected r.fs=true after compressed payload rejection")
+				}
+				if ri.fc {
+					t.Fatal("Expected r.fc=false after compressed payload rejection")
+				}
+				if !ri.ff {
+					t.Fatal("Expected r.ff=true after compressed payload rejection")
+				}
+				if ri.cbufs != nil || ri.coff != 0 || ri.csz != 0 || ri.rem != 0 {
+					t.Fatalf("Expected compressed state reset, got cbufs=%v coff=%d csz=%d rem=%d", ri.cbufs != nil, ri.coff, ri.csz, ri.rem)
+				}
+			},
+		},
+		{
+			cframe: func() []byte {
+				payload := bytes.Repeat([]byte{0}, 2048)
+				buf := &bytes.Buffer{}
+				compressor, _ := flate.NewWriter(buf, 1)
+				compressor.Write(payload)
+				compressor.Flush()
+				compressed := buf.Bytes()
+				compressed = compressed[:len(compressed)-4]
+				frame := testWSCreateClientMsg(wsBinaryMessage, 1, true, false, compressed)
+				frame[0] |= wsRsv1Bit
+				return frame
+			},
+			err: ErrMaxPayload.Error(), nbufs: 1,
+			setup: func(c *client) {
+				atomic.StoreInt32(&c.mpay, 16)
+				c.ws.compress = true
+			},
+			verify: func(t *testing.T, ri *wsReadInfo) {
+				if !ri.fs {
+					t.Fatal("Expected r.fs=true after decompression error")
+				}
+				if ri.fc {
+					t.Fatal("Expected r.fc=false after decompression error")
+				}
+				if !ri.ff {
+					t.Fatal("Expected r.ff=true after decompression error")
+				}
+				if ri.cbufs != nil || ri.coff != 0 || ri.csz != 0 || ri.rem != 0 {
+					t.Fatalf("Expected compressed state reset, got cbufs=%v coff=%d csz=%d rem=%d", ri.cbufs != nil, ri.coff, ri.csz, ri.rem)
+				}
+			},
 		},
 	} {
 		t.Run(test.err, func(t *testing.T) {
 			c, ri, tr := testWSSetupForRead()
+			if test.setup != nil {
+				test.setup(c)
+			}
 			// Add a valid message first
 			msg := testWSCreateClientMsg(wsBinaryMessage, 1, true, false, []byte("hello"))
 			// Then add the bad frame
@@ -991,8 +1100,33 @@ func TestWSReadErrors(t *testing.T) {
 			if string(bufs[0]) != "hello" {
 				t.Fatalf("Unexpected content: %s", bufs[0])
 			}
+			if test.verify != nil {
+				test.verify(t, ri)
+			}
 		})
 	}
+}
+
+func TestWSReadHugePayloadLenDoesNotPanic(t *testing.T) {
+	c, ri, tr := testWSSetupForRead()
+	defer require_NoPanic(t)
+
+	rb := make([]byte, 14)
+	rb[0] = byte(wsBinaryMessage) | wsFinalBit
+	rb[1] = 127 | wsMaskBit
+	binary.BigEndian.PutUint64(rb[2:], ^uint64(0))
+	copy(rb[10:], []byte{1, 2, 3, 4})
+
+	_, err := c.wsRead(ri, tr, rb)
+	require_Error(t, err, errors.New("invalid 64-bit payload length"))
+}
+
+func TestWSReadByteWithEmptyCompressedBufferDoesNotPanic(t *testing.T) {
+	r := &wsReadInfo{cbufs: [][]byte{{}}}
+	defer require_NoPanic(t)
+
+	_, err := r.ReadByte()
+	require_Error(t, err, io.EOF)
 }
 
 func TestWSEnqueueCloseMsg(t *testing.T) {
@@ -1067,6 +1201,26 @@ func (trw *testResponseWriter) WriteHeader(status int) {
 }
 
 func (trw *testResponseWriter) Header() http.Header {
+	if trw.headers == nil {
+		trw.headers = make(http.Header)
+	}
+	return trw.headers
+}
+
+type testNoHijackResponseWriter struct {
+	buf     bytes.Buffer
+	headers http.Header
+}
+
+func (trw *testNoHijackResponseWriter) Write(p []byte) (int, error) {
+	return trw.buf.Write(p)
+}
+
+func (trw *testNoHijackResponseWriter) WriteHeader(status int) {
+	trw.buf.WriteString(fmt.Sprintf("%v", status))
+}
+
+func (trw *testNoHijackResponseWriter) Header() http.Header {
 	if trw.headers == nil {
 		trw.headers = make(http.Header)
 	}
@@ -1149,6 +1303,7 @@ func TestWSCheckOrigin(t *testing.T) {
 	sameOrigin := true
 	allowedListEmpty := []string{}
 	someList := []string{"http://host1.com", "http://host2.com:1234"}
+	sameHostMultiScheme := []string{"http://host3.com", "https://host3.com"}
 
 	for _, test := range []struct {
 		name       string
@@ -1163,6 +1318,7 @@ func TestWSCheckOrigin(t *testing.T) {
 		{"same origin ok", sameOrigin, allowedListEmpty, "host.com", false, "http://host.com:80", ""},
 		{"same origin bad host", sameOrigin, allowedListEmpty, "host.com", false, "http://other.host.com", "not same origin"},
 		{"same origin bad port", sameOrigin, allowedListEmpty, "host.com", false, "http://host.com:81", "not same origin"},
+		{"same origin bad scheme explicit port", sameOrigin, allowedListEmpty, "host.com:443", true, "http://host.com:443", "not same origin"},
 		{"same origin bad scheme", sameOrigin, allowedListEmpty, "host.com", true, "http://host.com", "not same origin"},
 		{"same origin bad uri", sameOrigin, allowedListEmpty, "host.com", false, "@@@://invalid:url:1234", "invalid URI"},
 		{"same origin bad url", sameOrigin, allowedListEmpty, "host.com", false, "http://invalid:url:1234", "too many colons"},
@@ -1172,6 +1328,8 @@ func TestWSCheckOrigin(t *testing.T) {
 		{"no origin same origin and list ignored", sameOrigin, someList, "", false, "", ""},
 		{"allowed from list", notSameOrigin, someList, "", false, "http://host2.com:1234", ""},
 		{"allowed with different path", notSameOrigin, someList, "", false, "http://host1.com/some/path", ""},
+		{"allowed from list same host http", notSameOrigin, sameHostMultiScheme, "", false, "http://host3.com", ""},
+		{"allowed from list same host https", notSameOrigin, sameHostMultiScheme, "", false, "https://host3.com", ""},
 		{"list bad port", notSameOrigin, someList, "", false, "http://host1.com:1234", "not in the allowed list"},
 		{"list bad scheme", notSameOrigin, someList, "", false, "https://host2.com:1234", "not in the allowed list"},
 	} {
@@ -1271,6 +1429,28 @@ func TestWSUpgradeValidationErrors(t *testing.T) {
 				return opts, nil, req
 			},
 			"key missing",
+			http.StatusBadRequest,
+		},
+		{
+			"invalid key encoding",
+			func() (*Options, *testResponseWriter, *http.Request) {
+				opts := testWSOptions()
+				req := testWSCreateValidReq()
+				req.Header.Set("Sec-Websocket-Key", "%%%")
+				return opts, nil, req
+			},
+			"invalid websocket key",
+			http.StatusBadRequest,
+		},
+		{
+			"invalid key length",
+			func() (*Options, *testResponseWriter, *http.Request) {
+				opts := testWSOptions()
+				req := testWSCreateValidReq()
+				req.Header.Set("Sec-Websocket-Key", base64.StdEncoding.EncodeToString([]byte("short")))
+				return opts, nil, req
+			},
+			"invalid websocket key",
 			http.StatusBadRequest,
 		},
 		{
@@ -1383,6 +1563,24 @@ func TestWSUpgradeResponseWriteError(t *testing.T) {
 	}
 }
 
+func TestWSUpgradeNoHijacker(t *testing.T) {
+	opts := testWSOptions()
+	s := &Server{opts: opts}
+	rw := &testNoHijackResponseWriter{}
+	req := testWSCreateValidReq()
+	res, err := s.wsUpgrade(rw, req)
+	if err == nil || !strings.Contains(err.Error(), "websocket upgrade not supported") {
+		t.Fatalf("Should get error %q, got %v", "websocket upgrade not supported", err)
+	}
+	if res != nil {
+		t.Fatalf("Should not have returned a result, got %v", res)
+	}
+	expected := fmt.Sprintf("%v%s\n", http.StatusBadRequest, http.StatusText(http.StatusBadRequest))
+	if got := rw.buf.String(); got != expected {
+		t.Fatalf("Expected %q got %q", expected, got)
+	}
+}
+
 func TestWSUpgradeConnDeadline(t *testing.T) {
 	opts := testWSOptions()
 	opts.Websocket.HandshakeTimeout = time.Second
@@ -1399,6 +1597,21 @@ func TestWSUpgradeConnDeadline(t *testing.T) {
 	if !rw.conn.deadlineCleared {
 		t.Fatal("Connection deadline should have been cleared after handshake")
 	}
+}
+
+func TestWSUpgradeWithEmptyXForwardedForSliceDoesNotPanic(t *testing.T) {
+	opts := testWSOptions()
+	s := &Server{opts: opts}
+	rw := &testResponseWriter{}
+	req := testWSCreateValidReq()
+	req.Header[wsXForwardedForHeader] = []string{}
+	defer require_NoPanic(t)
+
+	res, err := s.wsUpgrade(rw, req)
+	require_NoError(t, err)
+	require_NotNil(t, res)
+	require_NotNil(t, res.ws)
+	require_Equal(t, res.ws.clientIP, _EMPTY_)
 }
 
 func TestWSCompressNegotiation(t *testing.T) {
@@ -1727,6 +1940,16 @@ func TestWSValidateOptions(t *testing.T) {
 			o.Websocket.AllowedOrigins = []string{"http://this:is:bad:url"}
 			return o
 		}, "unable to parse"},
+		{"allowed origin must be absolute URL", func() *Options {
+			o := wso.Clone()
+			o.Websocket.AllowedOrigins = []string{"foo"}
+			return o
+		}, "unable to parse"},
+		{"allowed origin scheme must be http or https", func() *Options {
+			o := wso.Clone()
+			o.Websocket.AllowedOrigins = []string{"ftp://host.com"}
+			return o
+		}, "must be absolute URLs with http or https scheme"},
 		{"missing trusted configuration", func() *Options {
 			o := wso.Clone()
 			o.Websocket.JWTCookie = "jwt"
@@ -3264,6 +3487,59 @@ func TestWSCompressionFrameSizeLimit(t *testing.T) {
 	}
 }
 
+func TestWSCompressionPoolBufferRecycling(t *testing.T) {
+	opts := testWSOptions()
+	opts.MaxPending = MAX_PENDING_SIZE
+	s := &Server{opts: opts}
+	c := &client{srv: s, ws: &websocket{compress: true}}
+	c.initClient()
+
+	// Use a payload larger than wsCompressThreshold (64 bytes)
+	// to trigger the compression path.
+	payload := make([]byte, 256)
+	for i := range payload {
+		// Semi-random to be compressible.
+		payload[i] = byte(i % 251)
+	}
+
+	// Warm up: populate the pool and initialize the compressor.
+	nbSlice := make(net.Buffers, 1)
+	for i := 0; i < 10; i++ {
+		c.mu.Lock()
+		data := nbPoolGet(len(payload))
+		data = append(data, payload...)
+		nbSlice[0] = data
+		c.out.nb = nbSlice
+		c.out.pb = int64(len(payload))
+		c.ws.fs = 0
+		bufs, _ := c.collapsePtoNB()
+		for _, buf := range bufs {
+			nbPoolPut(buf)
+		}
+		c.out.nb = nil
+		c.mu.Unlock()
+	}
+
+	allocs := testing.AllocsPerRun(500, func() {
+		c.mu.Lock()
+		data := nbPoolGet(len(payload))
+		data = append(data, payload...)
+		nbSlice[0] = data
+		c.out.nb = nbSlice
+		c.out.pb = int64(len(payload))
+		c.ws.fs = 0
+		bufs, _ := c.collapsePtoNB()
+		for _, buf := range bufs {
+			nbPoolPut(buf)
+		}
+		c.out.nb = nil
+		c.mu.Unlock()
+	})
+	if allocs > 2 {
+		t.Fatalf("Too many allocs per iteration (%.1f); pool buffers are likely being leaked", allocs)
+	}
+}
+
 func TestWSBasicAuth(t *testing.T) {
 	for _, test := range []struct {
 		name    string
@@ -4484,13 +4760,14 @@ func TestWSDecompressLimit(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			conf := createConfFile(t, fmt.Appendf(nil, `
-				listen: "127.0.0.1:-1"
-				websocket {
 					listen: "127.0.0.1:-1"
-					no_tls: true
-				}
-				%s
-			`, test.mpayCfg))
+					websocket {
+						listen: "127.0.0.1:-1"
+						no_tls: true
+						compression: true
+					}
+					%s
+				`, test.mpayCfg))
 			s, o := RunServerWithConfig(conf)
 			defer s.Shutdown()
 

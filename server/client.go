@@ -869,6 +869,11 @@ func (c *client) registerWithAccount(acc *Account) error {
 	}
 
 	c.mu.Lock()
+	// This check does not apply to SYSTEM or JETSTREAM or ACCOUNT clients (because they don't have a `nc`...)
+	if c.isClosed() && !isInternalClient(c.kind) {
+		c.mu.Unlock()
+		return ErrConnectionClosed
+	}
 	kind := c.kind
 	srv := c.srv
 	c.acc = acc
@@ -928,14 +933,14 @@ func (c *client) applyAccountLimits() {
 	c.msubs = jwt.NoLimit
 	if c.opts.JWT != _EMPTY_ { // user jwt implies account
 		if uc, _ := jwt.DecodeUserClaims(c.opts.JWT); uc != nil {
-			atomic.StoreInt32(&c.mpay, int32(uc.Limits.Payload))
-			c.msubs = int32(uc.Limits.Subs)
+			atomic.StoreInt32(&c.mpay, clampInt64ToInt32(uc.Limits.Payload))
+			c.msubs = clampInt64ToInt32(uc.Limits.Subs)
 			if uc.IssuerAccount != _EMPTY_ && uc.IssuerAccount != uc.Issuer {
 				if scope, ok := c.acc.signingKeys[uc.Issuer]; ok {
 					if userScope, ok := scope.(*jwt.UserScope); ok {
 						// if signing key disappeared or changed and we don't get here, the client will be disconnected
-						c.mpay = int32(userScope.Template.Limits.Payload)
-						c.msubs = int32(userScope.Template.Limits.Subs)
+						c.mpay = clampInt64ToInt32(userScope.Template.Limits.Payload)
+						c.msubs = clampInt64ToInt32(userScope.Template.Limits.Subs)
 					}
 				}
 			}
@@ -1686,9 +1691,11 @@ func (c *client) flushOutbound() bool {
 
 		cw.Reset(&bb)
 		for _, buf := range collapsed {
-			if _, err = cw.Write(buf); err != nil {
-				break
+			if err == nil {
+				_, err = cw.Write(buf)
 			}
+			// Return always after consumed or error.
+			nbPoolPut(buf)
 		}
 		if err == nil {
 			err = cw.Close()

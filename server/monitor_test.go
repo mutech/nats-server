@@ -5615,7 +5615,7 @@ func TestMonitorWebsocket(t *testing.T) {
 		TLSMap:           true,
 		TLSPinnedCerts:   pinnedCerts,
 		SameOrigin:       true,
-		AllowedOrigins:   []string{"origin1", "origin2"},
+		AllowedOrigins:   []string{"https://origin1", "https://origin2"},
 		Compression:      true,
 		HandshakeTimeout: 4 * time.Second,
 	}
@@ -5633,7 +5633,7 @@ func TestMonitorWebsocket(t *testing.T) {
 		TLSMap:           true,
 		TLSPinnedCerts:   []string{"7f83b1657ff1fc53b92dc18148a1d65dfc2d4b1fa3d677284addd200126d9069"},
 		SameOrigin:       true,
-		AllowedOrigins:   []string{"origin1", "origin2"},
+		AllowedOrigins:   []string{"https://origin1", "https://origin2"},
 		Compression:      true,
 		HandshakeTimeout: 4 * time.Second,
 	}
@@ -6600,4 +6600,68 @@ func TestMonitorVarzTLSCertEndDate(t *testing.T) {
 	check(t, v.LeafNode.TLSCertNotAfter)
 	check(t, v.MQTT.TLSCertNotAfter)
 	check(t, v.Websocket.TLSCertNotAfter)
+}
+
+func TestMetaClusterInfoSnapshotStats(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	// Create a stream to generate some meta activity.
+	s := c.randomNonLeader()
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	leader := c.leader()
+	require_True(t, leader != nil)
+
+	// Check Jsz() includes Snapshot.
+	checkFor(t, 5*time.Second, 250*time.Millisecond, func() error {
+		jsi, err := leader.Jsz(nil)
+		if err != nil {
+			return err
+		}
+		if jsi.Meta == nil {
+			return errors.New("expected meta cluster info from Jsz")
+		}
+		if jsi.Meta.Snapshot == nil {
+			return errors.New("expected snapshot stats in Jsz meta cluster info")
+		}
+		return nil
+	})
+
+	// Check Varz() includes Snapshot.
+	checkFor(t, 5*time.Second, 250*time.Millisecond, func() error {
+		v, err := leader.Varz(nil)
+		if err != nil {
+			return err
+		}
+		if v.JetStream.Meta == nil {
+			return errors.New("expected meta cluster info from Varz")
+		}
+		if v.JetStream.Meta.Snapshot == nil {
+			return errors.New("expected snapshot stats in Varz meta cluster info")
+		}
+		return nil
+	})
+
+	// Check STATSZ event includes Snapshot.
+	snc, _ := jsClientConnect(t, c.randomServer(), nats.UserInfo("admin", "s3cr3t!"))
+	defer snc.Close()
+
+	ch := make(chan *nats.Msg, 1)
+	_, err = snc.ChanSubscribe(fmt.Sprintf(serverStatsSubj, leader.ID()), ch)
+	require_NoError(t, err)
+
+	msg := require_ChanRead(t, ch, 5*time.Second)
+	var m ServerStatsMsg
+	require_NoError(t, json.Unmarshal(msg.Data, &m))
+	require_True(t, m.Stats.JetStream != nil)
+	require_True(t, m.Stats.JetStream.Meta != nil)
+	require_True(t, m.Stats.JetStream.Meta.Snapshot != nil)
 }

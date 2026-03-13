@@ -2977,10 +2977,13 @@ func TestJetStreamClusterAPILimitDefault(t *testing.T) {
 	for _, s := range c.servers {
 		s.optsMu.RLock()
 		lim := s.opts.JetStreamRequestQueueLimit
+		ilim := s.opts.JetStreamInfoQueueLimit
 		s.optsMu.RUnlock()
 
 		require_Equal(t, lim, JSDefaultRequestQueueLimit)
+		require_Equal(t, ilim, JSDefaultRequestQueueLimit)
 		require_Equal(t, atomic.LoadInt64(&s.getJetStream().queueLimit), JSDefaultRequestQueueLimit)
+		require_Equal(t, atomic.LoadInt64(&s.getJetStream().infoQueueLimit), JSDefaultRequestQueueLimit)
 	}
 }
 
@@ -4857,29 +4860,15 @@ func TestJetStreamClusterStreamAckMsgR3SignalsRemovedMsg(t *testing.T) {
 	_, err = js.Publish("foo", nil)
 	require_NoError(t, err)
 
-	getStreamAndConsumer := func(s *Server) (*stream, *consumer, error) {
-		t.Helper()
-		acc, err := s.lookupAccount(globalAccountName)
-		if err != nil {
-			return nil, nil, err
-		}
-		mset, err := acc.lookupStream("TEST")
-		if err != nil {
-			return nil, nil, err
-		}
-		o := mset.lookupConsumer("CONSUMER")
-		if err != nil {
-			return nil, nil, err
-		}
-		return mset, o, nil
-	}
-
 	// Wait for all servers to know about the stream and consumer.
 	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
 		for _, s := range c.servers {
-			_, _, err = getStreamAndConsumer(s)
+			mset, err := s.globalAccount().lookupStream("TEST")
 			if err != nil {
 				return err
+			}
+			if mset.lookupConsumer("CONSUMER") == nil {
+				return errors.New("consumer not found")
 			}
 		}
 		return nil
@@ -4890,27 +4879,41 @@ func TestJetStreamClusterStreamAckMsgR3SignalsRemovedMsg(t *testing.T) {
 		return checkState(t, c, globalAccountName, "TEST")
 	})
 
-	sl := c.consumerLeader(globalAccountName, "TEST", "CONSUMER")
-	sf := c.randomNonConsumerLeader(globalAccountName, "TEST", "CONSUMER")
+	sl := c.streamLeader(globalAccountName, "TEST")
+	sf := c.randomNonStreamLeader(globalAccountName, "TEST")
 
-	msetL, ol, err := getStreamAndConsumer(sl)
+	msetL, err := sl.globalAccount().lookupStream("TEST")
 	require_NoError(t, err)
-	msetF, of, err := getStreamAndConsumer(sf)
+	ol := msetL.lookupConsumer("CONSUMER")
+	require_NotNil(t, ol)
+	msetF, err := sf.globalAccount().lookupStream("TEST")
 	require_NoError(t, err)
+	of := msetF.lookupConsumer("CONSUMER")
+	require_NotNil(t, of)
 
 	// Too high sequence, should register pre-ack and return true allowing for retries.
 	require_True(t, msetL.ackMsg(ol, 100))
 	require_True(t, msetF.ackMsg(of, 100))
 
 	// We're bypassing the normal ack flow, so must set these values ourselves.
-	ol.mu.Lock()
-	ol.sseq, ol.dseq = 2, 2
-	ol.asflr, ol.adflr = 1, 1
-	ol.mu.Unlock()
-	require_NoError(t, of.store.Update(&ConsumerState{
-		Delivered: SequencePair{1, 1},
-		AckFloor:  SequencePair{1, 1},
-	}))
+	for _, s := range c.servers {
+		mset, err := s.globalAccount().lookupStream("TEST")
+		require_NoError(t, err)
+		o := mset.lookupConsumer("CONSUMER")
+		require_NotNil(t, o)
+
+		if o.IsLeader() {
+			o.mu.Lock()
+			o.sseq, o.dseq = 2, 2
+			o.asflr, o.adflr = 1, 1
+			o.mu.Unlock()
+		} else {
+			require_NoError(t, o.store.Update(&ConsumerState{
+				Delivered: SequencePair{1, 1},
+				AckFloor:  SequencePair{1, 1},
+			}))
+		}
+	}
 
 	// Ack message on follower, should not remove message as that's proposed by the leader.
 	// But should still signal message removal.
@@ -4919,7 +4922,7 @@ func TestJetStreamClusterStreamAckMsgR3SignalsRemovedMsg(t *testing.T) {
 	// Confirm all servers have the message.
 	var smv StoreMsg
 	for _, s := range c.servers {
-		mset, _, err := getStreamAndConsumer(s)
+		mset, err := s.globalAccount().lookupStream("TEST")
 		require_NoError(t, err)
 		sm, err := mset.store.LoadMsg(1, &smv)
 		require_NoError(t, err)
@@ -4930,7 +4933,7 @@ func TestJetStreamClusterStreamAckMsgR3SignalsRemovedMsg(t *testing.T) {
 	require_True(t, msetL.ackMsg(ol, 1))
 	checkFor(t, 5*time.Second, 200*time.Millisecond, func() error {
 		for _, s := range c.servers {
-			mset, _, err := getStreamAndConsumer(s)
+			mset, err := s.globalAccount().lookupStream("TEST")
 			if err != nil {
 				return err
 			}
@@ -5384,7 +5387,7 @@ func TestJetStreamClusterRoutedAPIRecoverPerformance(t *testing.T) {
 		require_NoError(t, nc.PublishMsg(msg))
 	}
 	checkFor(t, 5*time.Second, 25*time.Millisecond, func() error {
-		if queued := leader.jsAPIRoutedReqs.len(); queued != count {
+		if queued := leader.jsAPIRoutedInfoReqs.len(); queued != count {
 			return fmt.Errorf("expected %d queued requests, got %d", count, queued)
 		}
 		return nil
@@ -7328,5 +7331,297 @@ func TestJetStreamClusterMetaCompactSizeThreshold(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// Test that setStoreState treats ErrStoreOldUpdate as a non-error.
+// This can happen during processClusterCreateConsumer when a consumer
+// assignment carries stale state (e.g. from a stream restore or meta
+// snapshot), but the consumer was already recovered from disk with
+// newer state. Without the fix, the error would propagate and cause
+// the consumer to be stopped and its Raft node deleted.
+func TestJetStreamClusterConsumerSetStoreStateOldUpdate(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Durable:   "CONSUMER",
+		Replicas:  3,
+		AckPolicy: nats.AckExplicitPolicy,
+	})
+	require_NoError(t, err)
+
+	// Publish messages and ack them to advance the consumer state.
+	for i := 0; i < 10; i++ {
+		_, err = js.Publish("foo", []byte("msg"))
+		require_NoError(t, err)
+	}
+	sub, err := js.PullSubscribe("foo", "CONSUMER")
+	require_NoError(t, err)
+	msgs, err := sub.Fetch(10)
+	require_NoError(t, err)
+	require_Len(t, len(msgs), 10)
+	for _, m := range msgs {
+		err = m.AckSync()
+		require_NoError(t, err)
+	}
+
+	// Wait for all consumers on all servers to be caught up to ack floor 10.
+	checkFor(t, 5*time.Second, 200*time.Millisecond, func() error {
+		for _, s := range c.servers {
+			a, err := s.lookupAccount(globalAccountName)
+			if err != nil {
+				return err
+			}
+			ms, err := a.lookupStream("TEST")
+			if err != nil {
+				return err
+			}
+			co := ms.lookupConsumer("CONSUMER")
+			if co == nil {
+				return errors.New("consumer not found")
+			}
+			info := co.info()
+			if info.AckFloor.Consumer != 10 {
+				return fmt.Errorf("expected ack floor 10, got %d", info.AckFloor.Consumer)
+			}
+		}
+		return nil
+	})
+
+	// Pick a follower server to test on. This simulates the scenario where
+	// a consumer already exists with advanced state and then
+	// processClusterCreateConsumer is called with stale state.
+	rs := c.randomNonConsumerLeader(globalAccountName, "TEST", "CONSUMER")
+	require_NotNil(t, rs)
+
+	// Grab the consumer's Raft node before the stale state is applied.
+	acc, err := rs.lookupAccount(globalAccountName)
+	require_NoError(t, err)
+	mset, err := acc.lookupStream("TEST")
+	require_NoError(t, err)
+	o := mset.lookupConsumer("CONSUMER")
+	require_NotNil(t, o)
+	o.mu.RLock()
+	raftNode := o.node
+	o.mu.RUnlock()
+	require_NotNil(t, raftNode)
+
+	// Build a consumer assignment with stale state, as would happen during
+	// a stream restore where the consumer info returned has older state.
+	rsjs := rs.getJetStream()
+	rsjs.mu.RLock()
+	ca := rsjs.consumerAssignment(globalAccountName, "TEST", "CONSUMER")
+	rsjs.mu.RUnlock()
+	require_NotNil(t, ca)
+
+	staleState := &ConsumerState{
+		Delivered: SequencePair{Consumer: 5, Stream: 5},
+		AckFloor:  SequencePair{Consumer: 5, Stream: 5},
+	}
+
+	// Check that consumer is running and healthy.
+	current := mset.lookupConsumer("CONSUMER")
+	if current == nil {
+		t.Errorf("Expected consumer to be present on restart")
+	}
+	cinfo := current.info()
+	require_Equal(t, cinfo.AckFloor.Consumer, 10)
+	require_Equal(t, cinfo.AckFloor.Stream, 10)
+
+	// Call processClusterCreateConsumer with the stale state, simulating
+	// what happens during stream restore or meta snapshot recovery.
+	// Without the fix, this would delete the consumer's Raft node and stop it.
+	rsjs.processClusterCreateConsumer(ca, ca, staleState, true)
+
+	// Verify the consumer still exists on this server.
+	o = mset.lookupConsumer("CONSUMER")
+	if o == nil {
+		t.Fatal("Expected consumer to still be present after consumer create with stale data")
+	}
+
+	// Verify the consumer's Raft node was NOT deleted.
+	o.mu.RLock()
+	nodeAfter := o.node
+	o.mu.RUnlock()
+	require_NotNil(t, nodeAfter)
+	require_Equal(t, raftNode, nodeAfter)
+
+	// Verify the consumer retained its correct (newer) state, not the stale state.
+	info := o.info()
+	require_Equal(t, info.AckFloor.Consumer, 10)
+	require_Equal(t, info.AckFloor.Stream, 10)
+
+	// Verify the consumer is still fully functional by publishing and consuming more.
+	for i := 0; i < 5; i++ {
+		_, err = js.Publish("foo", []byte("after-stale"))
+		require_NoError(t, err)
+	}
+	msgs, err = sub.Fetch(5)
+	require_NoError(t, err)
+	require_Len(t, len(msgs), 5)
+	for _, m := range msgs {
+		err = m.AckSync()
+		require_NoError(t, err)
+	}
+}
+
+func TestJetStreamClusterConsumerSetStoreStateOldUpdateRestart(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Durable:   "CONSUMER",
+		Replicas:  3,
+		AckPolicy: nats.AckExplicitPolicy,
+	})
+	require_NoError(t, err)
+
+	// Publish messages and ack them to advance the consumer state.
+	for i := 0; i < 10; i++ {
+		_, err = js.Publish("foo", []byte("msg"))
+		require_NoError(t, err)
+	}
+	sub, err := js.PullSubscribe("foo", "CONSUMER")
+	require_NoError(t, err)
+	msgs, err := sub.Fetch(10)
+	require_NoError(t, err)
+	require_Len(t, len(msgs), 10)
+	for _, m := range msgs {
+		err = m.AckSync()
+		require_NoError(t, err)
+	}
+
+	// Wait for all consumers on all servers to be caught up to ack floor 10.
+	checkFor(t, 5*time.Second, 200*time.Millisecond, func() error {
+		for _, s := range c.servers {
+			a, err := s.lookupAccount(globalAccountName)
+			if err != nil {
+				return err
+			}
+			ms, err := a.lookupStream("TEST")
+			if err != nil {
+				return err
+			}
+			co := ms.lookupConsumer("CONSUMER")
+			if co == nil {
+				return errors.New("consumer not found")
+			}
+			info := co.info()
+			if info.AckFloor.Consumer != 10 {
+				return fmt.Errorf("expected ack floor 10, got %d", info.AckFloor.Consumer)
+			}
+		}
+		return nil
+	})
+
+	// Pick a server that is not the meta leader. We will shut it down and
+	// then propose a stale consumer assignment entry to meta while it is
+	// down. When it restarts and catches up on the meta Raft, it will
+	// replay the entry with the stale State.
+	ml := c.leader()
+	require_NotNil(t, ml)
+	var rs *Server
+	for _, s := range c.servers {
+		if s != ml {
+			rs = s
+			break
+		}
+	}
+	require_NotNil(t, rs)
+
+	rs.Shutdown()
+	rs.WaitForShutdown()
+
+	// Reconnect to a remaining server.
+	nc.Close()
+	nc, js = jsClientConnect(t, ml)
+	defer nc.Close()
+
+	// Propose a consumer assignment with stale State to the meta Raft.
+	// This simulates what happens during a stream scale-down reassignment
+	// where the consumer info returned has older state than what the
+	// consumer already has on disk.
+	mljs := ml.getJetStream()
+	mljs.mu.RLock()
+	cc := mljs.cluster
+	ca := mljs.consumerAssignment(globalAccountName, "TEST", "CONSUMER")
+	require_NotNil(t, ca)
+
+	cca := ca.copyGroup()
+	cca.State = &ConsumerState{
+		Delivered: SequencePair{Consumer: 5, Stream: 5},
+		AckFloor:  SequencePair{Consumer: 5, Stream: 5},
+	}
+	consumerAdd := encodeAddConsumerAssignment(cca)
+	mljs.mu.RUnlock()
+	require_NoError(t, cc.meta.Propose(consumerAdd))
+
+	// Wait for the meta leader to apply the entry.
+	time.Sleep(500 * time.Millisecond)
+
+	// Restart the server. During meta Raft catchup, it will replay the
+	// consumer assignment entry that has State set to ack floor 5, but the
+	// consumer's store on disk already has ack floor 10. Without the fix,
+	// setStoreState returns ErrStoreOldUpdate which triggers
+	// rg.node.Delete() and o.stop(), destroying the consumer.
+	rs = c.restartServer(rs)
+	c.waitOnServerCurrent(rs)
+
+	// Verify the consumer still exists on the restarted server and has
+	// the correct (newer) state, not the stale state.
+	checkFor(t, 5*time.Second, 200*time.Millisecond, func() error {
+		a, err := rs.lookupAccount(globalAccountName)
+		if err != nil {
+			return err
+		}
+		ms, err := a.lookupStream("TEST")
+		if err != nil {
+			return err
+		}
+		co := ms.lookupConsumer("CONSUMER")
+		if co == nil {
+			return errors.New("consumer not found after restart - Raft node was likely deleted")
+		}
+		info := co.info()
+		if info.AckFloor.Consumer != 10 {
+			return fmt.Errorf("expected ack floor 10, got %d", info.AckFloor.Consumer)
+		}
+		return nil
+	})
+
+	// Verify the consumer is still fully functional by publishing and consuming more.
+	for i := 0; i < 5; i++ {
+		_, err = js.Publish("foo", []byte("after-restart"))
+		require_NoError(t, err)
+	}
+	sub, err = js.PullSubscribe("foo", "CONSUMER")
+	require_NoError(t, err)
+	msgs, err = sub.Fetch(5)
+	require_NoError(t, err)
+	require_Len(t, len(msgs), 5)
+	for _, m := range msgs {
+		err = m.AckSync()
+		require_NoError(t, err)
 	}
 }

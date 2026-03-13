@@ -6078,7 +6078,7 @@ func TestJetStreamClusterLimitsBasedStreamFileStoreDesync(t *testing.T) {
 	    ]
 	  }
 	  js {
-	    jetstream = { store_max_stream_bytes = 3mb }
+	    jetstream = { max_store = 3mb }
 	    users = [
 	      { user: js, pass: js }
 	    ]
@@ -8113,4 +8113,313 @@ func TestJetStreamClusterConsumerRemapWaitsForMonitorRoutineQuit(t *testing.T) {
 		}
 		return nil
 	})
+}
+
+func TestJetStreamClusterAccountStoreLimits(t *testing.T) {
+	test := func(t *testing.T, replicas int, storage nats.StorageType) {
+		storeLimit := fileStoreMsgSize("B", nil, nil)
+		memLimit := memStoreMsgSize("B", nil, nil)
+		limit := JetStreamAccountLimits{
+			MaxMemory:            int64(memLimit * 6),
+			MemoryMaxStreamBytes: int64(memLimit * 3),
+			MaxStore:             int64(storeLimit * 6),
+			StoreMaxStreamBytes:  int64(storeLimit * 3),
+			MaxBytesRequired:     true,
+		}
+		tier := fmt.Sprintf("R%d", replicas)
+		limits := map[string]JetStreamAccountLimits{tier: limit}
+
+		var s *Server
+		var c *cluster
+		if replicas == 1 {
+			s = RunBasicJetStreamServer(t)
+			defer s.Shutdown()
+			require_NoError(t, s.globalAccount().UpdateJetStreamLimits(limits))
+		} else {
+			c = createJetStreamClusterExplicit(t, "R3S", 3)
+			defer c.shutdown()
+			for _, cs := range c.servers {
+				require_NoError(t, cs.globalAccount().UpdateJetStreamLimits(limits))
+			}
+			s = c.randomServer()
+		}
+
+		resourcesErr := NewJSStorageResourcesExceededError()
+		maxAcc, maxBytes := limit.MaxStore, limit.StoreMaxStreamBytes
+		if storage == nats.MemoryStorage {
+			resourcesErr = NewJSMemoryResourcesExceededError()
+			maxAcc, maxBytes = limit.MaxMemory, limit.MemoryMaxStreamBytes
+		}
+
+		nc, js := jsClientConnect(t, s)
+		defer nc.Close()
+
+		// No MaxBytes errors because it's required.
+		_, err := js.AddStream(&nats.StreamConfig{Name: "A", Replicas: replicas, Storage: storage})
+		require_Error(t, err, NewJSStreamMaxBytesRequiredError())
+
+		// MaxBytes larger than account limit errors.
+		_, err = js.AddStream(&nats.StreamConfig{Name: "A", Replicas: replicas, Storage: storage, MaxBytes: maxAcc + 1})
+		if replicas == 1 {
+			require_Error(t, err, resourcesErr)
+		} else {
+			require_Error(t, err, NewJSStreamMaxStreamBytesExceededError())
+		}
+
+		// MaxBytes larger than bytes limit errors.
+		_, err = js.AddStream(&nats.StreamConfig{Name: "A", Replicas: replicas, Storage: storage, MaxBytes: maxBytes + 1})
+		require_Error(t, err, NewJSStreamMaxStreamBytesExceededError())
+
+		// Create two streams that exactly fit the limit.
+		for _, subj := range []string{"A", "B"} {
+			_, err = js.AddStream(&nats.StreamConfig{Name: subj, Replicas: replicas, Storage: storage, MaxBytes: maxBytes})
+			require_NoError(t, err)
+		}
+
+		// Another stream over the limit errors.
+		_, err = js.AddStream(&nats.StreamConfig{Name: "C", Replicas: replicas, Storage: storage, MaxBytes: 1})
+		require_Error(t, err, resourcesErr)
+
+		// We can publish more than the maximum bytes into the stream as it is DiscardOld.
+		for range 10 {
+			_, err = js.Publish("A", nil)
+			require_NoError(t, err)
+		}
+
+		// Once the last stream fills up too close to the account limit, we eventually get an error.
+		start := time.Now()
+		for i := 0; ; i++ {
+			if time.Since(start) > 5*time.Second {
+				t.Fatalf("timed out waiting for error")
+			}
+			_, err = js.Publish("B", nil)
+			if i < 3 {
+				require_NoError(t, err)
+			} else if replicas == 1 {
+				// Expect an error immediately after we hit the limit if we're R1.
+				require_Error(t, err, NewJSAccountResourcesExceededError())
+				break
+			} else if err != nil {
+				// For replicated this might take some time as servers report about their usage.
+				require_Error(t, err, NewJSAccountResourcesExceededError())
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+
+		// If clustered, confirm all is in sync still.
+		if c != nil {
+			checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+				return checkState(t, c, globalAccountName, "B")
+			})
+		}
+	}
+
+	for _, replicas := range []int{1, 3} {
+		t.Run(fmt.Sprintf("R%d", replicas), func(t *testing.T) {
+			t.Run("Memory", func(t *testing.T) { test(t, replicas, nats.MemoryStorage) })
+			t.Run("File", func(t *testing.T) { test(t, replicas, nats.FileStorage) })
+		})
+	}
+}
+
+func TestJetStreamClusterDontEncodeConsumerStateInMetaSnapshot(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	// Add a replicated stream and a single replica consumer.
+	scfg := &nats.StreamConfig{Name: "TEST", Replicas: 3}
+	_, err := js.AddStream(scfg)
+	require_NoError(t, err)
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{Name: "CONSUMER", Replicas: 1})
+	require_NoError(t, err)
+
+	// Ensure the stream and consumer leaders differ.
+	sl := c.streamLeader(globalAccountName, "TEST")
+	cl := c.consumerLeader(globalAccountName, "TEST", "CONSUMER")
+	if sl == cl {
+		mset, err := sl.globalAccount().lookupStream("TEST")
+		require_NoError(t, err)
+		require_NoError(t, mset.raftNode().StepDown())
+		c.waitOnStreamLeader(globalAccountName, "TEST")
+		sl = c.streamLeader(globalAccountName, "TEST")
+	}
+	require_NotEqual(t, sl, cl)
+
+	// Scale down the stream so the R1 consumer needs to be moved to a different server.
+	scfg.Replicas = 1
+	_, err = js.UpdateStream(scfg)
+	require_NoError(t, err)
+
+	// Signal that the meta leader should create a snapshot. We need to do this indirectly
+	// through a noop peer change, as we need the monitor goroutine to perform the snapshot.
+	ml := c.leader()
+	require_NotNil(t, ml)
+	meta := ml.getJetStream().getMetaGroup().(*raft)
+	meta.RLock()
+	papplied := meta.papplied
+	meta.RUnlock()
+	require_NoError(t, meta.ProposeAddPeer(meta.ID()))
+	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+		meta.RLock()
+		defer meta.RUnlock()
+		if papplied == meta.papplied {
+			return errors.New("no snapshot yet")
+		}
+		return nil
+	})
+
+	// Load the new snapshot and validate consumer state isn't preserved.
+	snap, err := meta.loadLastSnapshot()
+	require_NoError(t, err)
+	sjs := ml.getJetStream()
+	accStreams, err := sjs.decodeMetaSnapshot(snap.data)
+	require_NoError(t, err)
+	require_Len(t, len(accStreams), 1)
+	streams := accStreams[globalAccountName]
+	require_Len(t, len(streams), 1)
+	stream := streams["TEST"]
+	require_NotNil(t, stream)
+	require_Len(t, len(stream.consumers), 1)
+	consumer := stream.consumers["CONSUMER"]
+	require_NotNil(t, consumer)
+	require_True(t, consumer.State == nil)
+}
+
+func TestJetStreamClusteredStreamCreateIdempotentWithSources(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "JSC", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "SOURCE",
+		Subjects: []string{"source.>"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	cfg := &nats.StreamConfig{
+		Name:     "SOURCED",
+		Subjects: []string{"sourced.>"},
+		Replicas: 3,
+		Sources: []*nats.StreamSource{
+			{
+				Name:          "SOURCE",
+				FilterSubject: "source.>",
+			},
+		},
+	}
+	_, err = js.AddStream(cfg)
+	require_NoError(t, err)
+
+	// Step down the stream leader until it lands on the meta leader.
+	// This ensures the meta leader's stored assignment has iname populated
+	// via the shared StreamSource pointer.
+	ml := c.leader()
+	require_NotNil(t, ml)
+	sl := c.streamLeader(globalAccountName, "SOURCED")
+	require_NotNil(t, sl)
+	if sl != ml {
+		mset, err := sl.globalAccount().lookupStream("SOURCED")
+		require_NoError(t, err)
+		require_NoError(t, mset.raftNode().StepDown(ml.Node()))
+		c.waitOnStreamLeader(globalAccountName, "SOURCED")
+		sl = c.streamLeader(globalAccountName, "SOURCED")
+	}
+	require_Equal(t, ml, sl)
+
+	// The second create should be idempotent, and succeed even though iname was set.
+	_, err = js.AddStream(cfg)
+	require_NoError(t, err)
+}
+
+func TestJetStreamClusterMetaSnapshotPreservesConsumersOnStreamUpdate(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	cfg := &nats.StreamConfig{Name: "TEST", Subjects: []string{"foo"}, Replicas: 3}
+	_, err := js.AddStream(cfg)
+	require_NoError(t, err)
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{Name: "CONSUMER", Replicas: 3})
+	require_NoError(t, err)
+
+	triggerMetaSnapshot := func(t *testing.T, c *cluster) {
+		t.Helper()
+		ml := c.leader()
+		require_NotNil(t, ml)
+		meta := ml.getJetStream().getMetaGroup().(*raft)
+		meta.RLock()
+		papplied := meta.papplied
+		meta.RUnlock()
+		require_NoError(t, meta.ProposeAddPeer(meta.ID()))
+		checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+			meta.RLock()
+			defer meta.RUnlock()
+			if papplied == meta.papplied {
+				return errors.New("no snapshot yet")
+			}
+			return nil
+		})
+	}
+
+	loadSnapshotStreams := func(t *testing.T, c *cluster) map[string]map[string]*streamAssignment {
+		t.Helper()
+		ml := c.leader()
+		require_NotNil(t, ml)
+		meta := ml.getJetStream().getMetaGroup().(*raft)
+		snap, err := meta.loadLastSnapshot()
+		require_NoError(t, err)
+		sjs := ml.getJetStream()
+		accStreams, err := sjs.decodeMetaSnapshot(snap.data)
+		require_NoError(t, err)
+		return accStreams
+	}
+
+	// Create a baseline snapshot that includes consumers.
+	triggerMetaSnapshot(t, c)
+	accStreams := loadSnapshotStreams(t, c)
+	stream := accStreams[globalAccountName]["TEST"]
+	require_NotNil(t, stream)
+	require_NotNil(t, stream.consumers["CONSUMER"])
+
+	// Update stream config, then create a new snapshot from the previous checkpoint.
+	cfg.Description = "updated"
+	_, err = js.UpdateStream(cfg)
+	require_NoError(t, err)
+	triggerMetaSnapshot(t, c)
+
+	// Updated snapshots must preserve existing stream consumers.
+	accStreams = loadSnapshotStreams(t, c)
+	stream = accStreams[globalAccountName]["TEST"]
+	require_NotNil(t, stream)
+	require_NotNil(t, stream.consumers["CONSUMER"])
+}
+
+func TestJetStreamClusterConsumerAssignmentsOrInflightSeqWithInflightStream(t *testing.T) {
+	const acc, stream, consumer = "A", "S", "C"
+	js := &jetStream{cluster: &jetStreamCluster{
+		streams: map[string]map[string]*streamAssignment{},
+		inflightStreams: map[string]map[string]*inflightStreamInfo{
+			acc: {stream: {streamAssignment: &streamAssignment{Config: &StreamConfig{Name: stream}}}},
+		},
+		inflightConsumers: map[string]map[string]map[string]*inflightConsumerInfo{
+			acc: {stream: {consumer: {consumerAssignment: &consumerAssignment{Name: consumer}}}},
+		},
+	}}
+
+	var got []string
+	for ca := range js.consumerAssignmentsOrInflightSeq(acc, stream) {
+		got = append(got, ca.Name)
+	}
+	if len(got) != 1 || got[0] != consumer {
+		t.Fatalf("Unexpected consumers: %+v", got)
+	}
 }

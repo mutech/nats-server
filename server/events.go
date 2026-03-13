@@ -1053,8 +1053,15 @@ func (s *Server) sendStatsz(subj string) {
 					Size:   mg.ClusterSize(),
 				}
 			}
-			if ipq := s.jsAPIRoutedReqs; ipq != nil && jStat.Meta != nil {
-				jStat.Meta.Pending = ipq.len()
+			if jStat.Meta != nil {
+				if ipq := s.jsAPIRoutedReqs; ipq != nil {
+					jStat.Meta.PendingRequests = ipq.len()
+				}
+				if ipq := s.jsAPIRoutedInfoReqs; ipq != nil {
+					jStat.Meta.PendingInfos = ipq.len()
+				}
+				jStat.Meta.Pending = jStat.Meta.PendingRequests + jStat.Meta.PendingInfos
+				jStat.Meta.Snapshot = s.metaClusterSnapshotStats(js, mg)
 			}
 		}
 		jStat.Limits = &s.getOpts().JetStreamLimits

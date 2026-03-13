@@ -2194,8 +2194,8 @@ func (ms *memStore) FastState(state *StreamState) {
 }
 
 func (ms *memStore) State() StreamState {
-	ms.mu.RLock()
-	defer ms.mu.RUnlock()
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
 
 	state := ms.state
 	state.Consumers = ms.consumers
@@ -2419,7 +2419,7 @@ func (o *consumerMemStore) Update(state *ConsumerState) error {
 
 	// Check to see if this is an outdated update.
 	if state.Delivered.Consumer < o.state.Delivered.Consumer || state.AckFloor.Stream < o.state.AckFloor.Stream {
-		return fmt.Errorf("old update ignored")
+		return ErrStoreOldUpdate
 	}
 
 	o.state.Delivered = state.Delivered

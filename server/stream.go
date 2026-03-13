@@ -632,6 +632,7 @@ const (
 	JSBatchSeq                = "Nats-Batch-Sequence"
 	JSBatchCommit             = "Nats-Batch-Commit"
 	JSSchedulePattern         = "Nats-Schedule"
+	JSScheduleTimeZone        = "Nats-Schedule-Time-Zone"
 	JSScheduleTTL             = "Nats-Schedule-TTL"
 	JSScheduleTarget          = "Nats-Schedule-Target"
 	JSScheduleSource          = "Nats-Schedule-Source"
@@ -1233,6 +1234,16 @@ func (mset *stream) setLeader(isLeader bool) error {
 			}
 			mset.mu.Unlock()
 			return err
+		}
+
+		// Reset any inflight fast batches. We were likely a follower before and need
+		// to send an ack to the publishers so they know we're still there.
+		if mset.batches != nil {
+			mset.batches.mu.Lock()
+			for batchId, b := range mset.batches.fast {
+				mset.batches.fastBatchReset(mset, batchId, b)
+			}
+			mset.batches.mu.Unlock()
 		}
 	} else {
 		// cancel timer to create the source consumers if not fired yet
@@ -1910,6 +1921,30 @@ func (s *Server) checkStreamCfg(config *StreamConfig, acc *Account, pedantic boo
 		} else {
 			return StreamConfig{}, NewJSSourceDuplicateDetectedError()
 		}
+
+		if src.FilterSubject != _EMPTY_ && len(src.SubjectTransforms) != 0 {
+			return StreamConfig{}, NewJSSourceMultipleFiltersNotAllowedError()
+		}
+
+		for _, tr := range src.SubjectTransforms {
+			if tr.Source != _EMPTY_ && !IsValidSubject(tr.Source) {
+				return StreamConfig{}, NewJSSourceInvalidSubjectFilterError(fmt.Errorf("%w %s", ErrBadSubject, tr.Source))
+			}
+			err := ValidateMapping(tr.Source, tr.Destination)
+			if err != nil {
+				return StreamConfig{}, NewJSSourceInvalidTransformDestinationError(err)
+			}
+		}
+
+		// Check subject filters overlap.
+		for outer, tr := range src.SubjectTransforms {
+			for inner, innertr := range src.SubjectTransforms {
+				if inner != outer && subjectIsSubsetMatch(tr.Source, innertr.Source) {
+					return StreamConfig{}, NewJSSourceOverlappingSubjectFiltersError()
+				}
+			}
+		}
+
 		// Do not perform checks if External is provided, as it could lead to
 		// checking against itself (if sourced stream name is the same on different JetStream)
 		if src.External == nil {
@@ -1920,30 +1955,6 @@ func (s *Server) checkStreamCfg(config *StreamConfig, acc *Account, pedantic boo
 			if exists {
 				if cfg.MaxMsgSize > 0 && maxMsgSize > 0 && cfg.MaxMsgSize < maxMsgSize {
 					return StreamConfig{}, NewJSSourceMaxMessageSizeTooBigError()
-				}
-			}
-
-			if src.FilterSubject != _EMPTY_ && len(src.SubjectTransforms) != 0 {
-				return StreamConfig{}, NewJSSourceMultipleFiltersNotAllowedError()
-			}
-
-			for _, tr := range src.SubjectTransforms {
-				if tr.Source != _EMPTY_ && !IsValidSubject(tr.Source) {
-					return StreamConfig{}, NewJSSourceInvalidSubjectFilterError(fmt.Errorf("%w %s", ErrBadSubject, tr.Source))
-				}
-
-				err := ValidateMapping(tr.Source, tr.Destination)
-				if err != nil {
-					return StreamConfig{}, NewJSSourceInvalidTransformDestinationError(err)
-				}
-			}
-
-			// Check subject filters overlap.
-			for outer, tr := range src.SubjectTransforms {
-				for inner, innertr := range src.SubjectTransforms {
-					if inner != outer && subjectIsSubsetMatch(tr.Source, innertr.Source) {
-						return StreamConfig{}, NewJSSourceOverlappingSubjectFiltersError()
-					}
 				}
 			}
 			continue
@@ -2879,6 +2890,12 @@ func (mset *stream) processMirrorMsgs(mirror *sourceInfo, ready *sync.WaitGroup)
 	// Grab stream quit channel.
 	mset.mu.Lock()
 	msgs, qch, siqch := mirror.msgs, mset.qch, mirror.qch
+	// If the mirror was already canceled before we got here, exit early.
+	if siqch == nil {
+		mset.mu.Unlock()
+		ready.Done()
+		return
+	}
 	// Set the last seen as now so that we don't fail at the first check.
 	mirror.last.Store(time.Now().UnixNano())
 	mset.mu.Unlock()
@@ -3484,6 +3501,7 @@ func (mset *stream) setupMirrorConsumer() error {
 						"consumer": mirror.cname,
 					},
 				) {
+					mirror.wg.Done()
 					ready.Done()
 				}
 			}
@@ -4598,8 +4616,17 @@ func (mset *stream) unsubscribeToStream(stopping, shuttingDown bool) error {
 	}
 	// Clear batching state.
 	mset.deleteAtomicBatches(shuttingDown)
-	mset.deleteFastBatches()
-	mset.batches = nil
+	if stopping || shuttingDown {
+		mset.deleteFastBatches()
+	}
+	if mset.batches != nil {
+		mset.batches.mu.Lock()
+		reset := len(mset.batches.atomic) == 0 && len(mset.batches.fast) == 0
+		mset.batches.mu.Unlock()
+		if reset {
+			mset.batches = nil
+		}
+	}
 
 	if stopping {
 		// In case we had a direct get subscriptions.
@@ -4996,9 +5023,7 @@ func getMessageSchedule(hdr []byte) (time.Time, bool) {
 	if len(hdr) == 0 {
 		return time.Time{}, true
 	}
-	val := bytesToString(sliceHeader(JSSchedulePattern, hdr))
-	schedule, _, ok := parseMsgSchedule(val, time.Now().UTC().UnixNano())
-	return schedule, ok
+	return nextMessageSchedule(hdr, time.Now().UTC().UnixNano())
 }
 
 // Fast lookup and calculation of next message schedule.
@@ -5007,7 +5032,8 @@ func nextMessageSchedule(hdr []byte, ts int64) (time.Time, bool) {
 		return time.Time{}, true
 	}
 	val := bytesToString(sliceHeader(JSSchedulePattern, hdr))
-	schedule, _, ok := parseMsgSchedule(val, ts)
+	tz := bytesToString(sliceHeader(JSScheduleTimeZone, hdr))
+	schedule, _, ok := parseMsgSchedule(val, tz, ts)
 	return schedule, ok
 }
 
@@ -5739,9 +5765,8 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 	var resp = &JSPubAckResponse{}
 
 	var (
-		batchId     string
-		batchSeq    uint64
-		batchAtomic bool
+		batchId  string
+		batchSeq uint64
 	)
 	// Populate batch details.
 	if fastBatch != nil {
@@ -5759,7 +5784,6 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 	}
 	if len(hdr) > 0 && batchId == _EMPTY_ {
 		if batchId = getBatchId(hdr); batchId != _EMPTY_ {
-			batchAtomic = true
 			batchSeq, _ = getBatchSequence(hdr)
 			// Disable consistency checking if this was already done
 			// earlier as part of the batch consistency check.
@@ -6323,11 +6347,14 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 		}
 		// If using fast batch publish, we occasionally send flow control messages.
 		// And, we need to ensure a PubAck is sent if the commit happens through EOB.
-		if batchId != _EMPTY_ && !batchAtomic && mset.batches != nil {
-			batches := mset.batches
-			batches.mu.Lock()
-			commit := batches.fastBatchRegisterSequences(mset, reply, batchId, batchSeq, mset.lseq)
-			batches.mu.Unlock()
+		if fastBatch != nil {
+			if mset.batches == nil {
+				mset.batches = &batching{}
+			}
+			mset.batches.mu.Lock()
+			// Check full leader state so we only send the client an update once we're caught up.
+			commit := mset.batches.fastBatchRegisterSequences(mset, reply, mset.lseq, mset.isLeader(), fastBatch)
+			mset.batches.mu.Unlock()
 			if !commit {
 				reply = _EMPTY_
 				canRespond = false
@@ -6412,10 +6439,6 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 	} else {
 		// Make sure to take into account any message assignments that we had to skip (clfs).
 		seq = lseq + 1 - clfs
-		// Check for preAcks and the need to clear it.
-		if mset.hasAllPreAcks(seq, subject) {
-			mset.clearAllPreAcks(seq)
-		}
 		err = store.StoreRawMsg(subject, hdr, msg, seq, ts, ttl, canConsistencyCheck)
 	}
 
@@ -6450,6 +6473,18 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 			outq.sendMsg(reply, response)
 		}
 		return err
+	}
+
+	// Check for preAcks and the need to clear it.
+	if mset.hasAllPreAcks(seq, subject) {
+		mset.clearAllPreAcks(seq)
+		// If we're clustered and the stream leader, we can now propose deleting this message.
+		// We still store it below, so we remain properly synchronized with our followers.
+		// If this proposal fails, we retry out-of-band.
+		if isClustered && isLeader {
+			md := streamMsgDelete{Seq: seq, NoErase: true, Stream: mset.cfg.Name}
+			_ = mset.node.Propose(encodeMsgDelete(&md))
+		}
 	}
 
 	// If here we succeeded in storing the message.
@@ -6523,11 +6558,14 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 
 	// If using fast batch publish, we occasionally send flow control messages.
 	// And, we need to ensure a PubAck is sent if the commit happens through EOB.
-	if batchId != _EMPTY_ && !batchAtomic && mset.batches != nil {
-		batches := mset.batches
-		batches.mu.Lock()
-		commit := batches.fastBatchRegisterSequences(mset, reply, batchId, batchSeq, mset.lseq)
-		batches.mu.Unlock()
+	if fastBatch != nil {
+		if mset.batches == nil {
+			mset.batches = &batching{}
+		}
+		mset.batches.mu.Lock()
+		// Check full leader state so we only send the client an update once we're caught up.
+		commit := mset.batches.fastBatchRegisterSequences(mset, reply, mset.lseq, mset.isLeader(), fastBatch)
+		mset.batches.mu.Unlock()
 		if !commit {
 			reply = _EMPTY_
 			canRespond = false
@@ -8255,9 +8293,13 @@ func (mset *stream) ackMsg(o *consumer, seq uint64) bool {
 		return true
 	}
 
-	// Only propose message deletion to the stream if we're consumer leader, otherwise all followers would also propose.
-	// We must be the consumer leader, since we know for sure we've stored the message and don't register as pre-ack.
-	if o != nil && !o.IsLeader() {
+	// Only propose message deletion to the stream if we're the leader, otherwise followers would also propose.
+	// We must be the stream leader, since we are the only one that can guarantee message ordering and ack handling.
+	// Either we've stored the message, and we know for sure all consumers have acked the message.
+	// Or, we've not stored the message yet (rare), and all consumers have registered as pre-acks,
+	// then we do the message delete proposal after we've stored the message instead.
+	// Except for a Direct AckNone consumer, as that has a nil consumer here, we still forward the delete proposal.
+	if o != nil && !mset.isLeader() {
 		// Currently, interest-based streams can race on "no interest" because consumer creates/updates go over
 		// the meta layer and published messages go over the stream layer. Some servers could then either store
 		// or not store some initial set of messages that gained new interest. To get the stream back in sync,
@@ -8276,6 +8318,7 @@ func (mset *stream) ackMsg(o *consumer, seq uint64) bool {
 	}
 
 	md := streamMsgDelete{Seq: seq, NoErase: true, Stream: mset.cfg.Name}
+	// Directly proposes if stream leader, otherwise forwards it.
 	mset.node.ForwardProposal(encodeMsgDelete(&md))
 	mset.mu.Unlock()
 	return true

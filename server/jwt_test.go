@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -5601,7 +5602,7 @@ func TestJWTJetStreamMaxAckPending(t *testing.T) {
 	require_True(t, ci.Config.MaxAckPending == 2000)
 }
 
-func TestJWTJetStreamMaxStreamBytes(t *testing.T) {
+func TestJWTJetStreamMaxStore(t *testing.T) {
 	sysKp, syspub := createKey(t)
 	sysJwt := encodeClaim(t, jwt.NewAccountClaims(syspub), syspub)
 	sysCreds := newUser(t, sysKp)
@@ -5610,7 +5611,7 @@ func TestJWTJetStreamMaxStreamBytes(t *testing.T) {
 	accClaim := jwt.NewAccountClaims(accPub)
 	accClaim.Name = "acc"
 	accClaim.Limits.JetStreamTieredLimits["R1"] = jwt.JetStreamLimits{
-		DiskStorage: jwt.NoLimit, MemoryStorage: jwt.NoLimit,
+		DiskStorage: 1024, MemoryStorage: jwt.NoLimit,
 		Consumer: jwt.NoLimit, Streams: jwt.NoLimit,
 		DiskMaxStreamBytes: 1024, MaxBytesRequired: false,
 	}
@@ -5650,30 +5651,26 @@ func TestJWTJetStreamMaxStreamBytes(t *testing.T) {
 	require_NoError(t, err)
 
 	_, err = js.AddStream(&nats.StreamConfig{Name: "foo", Replicas: 1, MaxBytes: 2048})
-	require_Error(t, err)
-	require_Equal(t, err.Error(), "nats: stream max bytes exceeds account limit max stream bytes")
+	require_Error(t, err, NewJSStorageResourcesExceededError())
 	_, err = js.AddStream(&nats.StreamConfig{Name: "foo", Replicas: 1, MaxBytes: 1024})
 	require_NoError(t, err)
 
 	msg := [900]byte{}
-	_, err = js.AddStream(&nats.StreamConfig{Name: "baz", Replicas: 1})
+	_, err = js.Publish("foo", msg[:])
 	require_NoError(t, err)
-	_, err = js.Publish("baz", msg[:])
-	require_NoError(t, err)
-	_, err = js.Publish("baz", msg[:]) // exceeds max stream bytes
+	_, err = js.Publish("foo", msg[:]) // exceeds storage limit
 	require_Error(t, err)
 	require_Equal(t, err.Error(), "nats: resource limits exceeded for account")
 
 	time.Sleep(time.Second - time.Since(start)) // make sure the time stamp changes
 	accClaim.Limits.JetStreamTieredLimits["R1"] = jwt.JetStreamLimits{
-		DiskStorage: jwt.NoLimit, MemoryStorage: jwt.NoLimit, Consumer: jwt.NoLimit, Streams: jwt.NoLimit,
+		DiskStorage: 3072, MemoryStorage: jwt.NoLimit, Consumer: jwt.NoLimit, Streams: jwt.NoLimit,
 		DiskMaxStreamBytes: 2048, MaxBytesRequired: true}
 	accJwt2 := encodeClaim(t, accClaim, accPub)
 	updateJwt(t, s.ClientURL(), sysCreds, accJwt2, 1)
 
 	_, err = js.AddStream(&nats.StreamConfig{Name: "bar", Replicas: 1, MaxBytes: 3000})
-	require_Error(t, err)
-	require_Equal(t, err.Error(), "nats: stream max bytes exceeds account limit max stream bytes")
+	require_Error(t, err, NewJSStorageResourcesExceededError())
 	_, err = js.AddStream(&nats.StreamConfig{Name: "bar", Replicas: 1, MaxBytes: 2048})
 	require_NoError(t, err)
 
@@ -5682,22 +5679,26 @@ func TestJWTJetStreamMaxStreamBytes(t *testing.T) {
 	require_Equal(t, ainfo.Tiers["R1"].Store, 933)
 
 	// This should be exactly at the limit of the account.
-	_, err = js.Publish("baz", []byte(strings.Repeat("A", 1082)))
+	_, err = js.Publish("foo", []byte(strings.Repeat("A", 991)))
 	require_NoError(t, err)
-
 	ainfo, err = js.AccountInfo()
 	require_NoError(t, err)
-	require_Equal(t, ainfo.Tiers["R1"].Store, 2048)
+	require_Equal(t, ainfo.Tiers["R1"].Store, 1024)
+	_, err = js.Publish("bar", []byte(strings.Repeat("A", 2015)))
+	require_NoError(t, err)
+	ainfo, err = js.AccountInfo()
+	require_NoError(t, err)
+	require_Equal(t, ainfo.Tiers["R1"].Store, 3072)
 
-	// Exceed max stream bytes limit.
-	_, err = js.Publish("baz", []byte("1"))
+	// Exceed storage limit.
+	_, err = js.Publish("bar", []byte("1"))
 	require_Error(t, err)
 	require_Equal(t, err.Error(), "nats: resource limits exceeded for account")
 
 	// Confirm no changes after rejected publish.
 	ainfo, err = js.AccountInfo()
 	require_NoError(t, err)
-	require_Equal(t, ainfo.Tiers["R1"].Store, 2048)
+	require_Equal(t, ainfo.Tiers["R1"].Store, 3072)
 
 	// test disabling max bytes required
 	_, err = js.UpdateStream(&nats.StreamConfig{Name: "bar", Replicas: 1})
@@ -7484,4 +7485,180 @@ func TestJWTClusterUserInfoContainsPermissions(t *testing.T) {
 	for range 1000 {
 		test()
 	}
+}
+
+func TestJWTAccountLimitsOverflowInt32(t *testing.T) {
+	// Without clamping, int32 truncation of values > MaxInt32 causes:
+	// - mleafs/mconns wrapping to negative, triggering panics in
+	//   updateRemoteServer (slice bounds out of range) and rejecting
+	//   all connections.
+	fooAC := newJWTTestAccountClaims()
+	fooAC.Limits.Conn = math.MaxInt32 + 1
+	fooAC.Limits.LeafNodeConn = math.MaxInt32 + 1
+	fooAC.Limits.Subs = math.MaxInt32 + 1
+	fooAC.Limits.Payload = math.MaxInt32 + 1
+
+	s, fooKP, c, _ := setupJWTTestWitAccountClaims(t, fooAC, "+OK")
+	defer s.Shutdown()
+	defer c.close()
+
+	fooPub, _ := fooKP.PublicKey()
+	fooAcc, _ := s.LookupAccount(fooPub)
+	fooAcc.mu.RLock()
+	mconns := fooAcc.mconns
+	mleafs := fooAcc.mleafs
+	msubs := fooAcc.msubs
+	mpay := fooAcc.mpay
+	fooAcc.mu.RUnlock()
+
+	// All account limits should be clamped to math.MaxInt32.
+	if mconns != math.MaxInt32 {
+		t.Fatalf("Expected account mconns to be MaxInt32 (%d), got %d", math.MaxInt32, mconns)
+	}
+	if mleafs != math.MaxInt32 {
+		t.Fatalf("Expected account mleafs to be MaxInt32 (%d), got %d", math.MaxInt32, mleafs)
+	}
+	if msubs != math.MaxInt32 {
+		t.Fatalf("Expected account msubs to be MaxInt32 (%d), got %d", math.MaxInt32, msubs)
+	}
+	if mpay != math.MaxInt32 {
+		t.Fatalf("Expected account mpay to be MaxInt32 (%d), got %d", math.MaxInt32, mpay)
+	}
+
+	// Simulate a remote server update — without clamping this panics with:
+	//   panic: runtime error: slice bounds out of range [2147483648:0]
+	clients := fooAcc.updateRemoteServer(&AccountNumConns{
+		Server: ServerInfo{
+			ID:   "fake-server-1",
+			Name: "fake-nats-1",
+		},
+		AccountStat: AccountStat{
+			Account:   fooPub,
+			Conns:     1,
+			LeafNodes: 1,
+		},
+	})
+	if len(clients) != 0 {
+		t.Fatalf("Expected no clients to disconnect, got %d", len(clients))
+	}
+}
+
+func TestJWTUserLimitsOverflowInt32SubPub(t *testing.T) {
+	t.Run("Subs", func(t *testing.T) {
+		nuc := newJWTTestUserClaims()
+		// Without clamping, int32(math.MaxInt32+1) wraps to MinInt32,
+		// making subsAtLimit() always true and blocking all subscriptions.
+		nuc.Limits.Subs = math.MaxInt32 + 1
+		s, c, cr := setupJWTTestWithUserClaims(t, nuc, "+OK")
+		defer s.Shutdown()
+		defer c.close()
+
+		expectPong(t, cr)
+
+		// With clamping, subscriptions should succeed.
+		// Before, this would have been `-ERR 'maximum subscriptions exceeded`
+		c.parseAsync("SUB foo 1\r\nPING\r\n")
+		l, _ := cr.ReadString('\n')
+		if !strings.HasPrefix(l, "+OK") {
+			t.Fatalf("Expected +OK, got %q", l)
+		}
+	})
+
+	t.Run("Payload", func(t *testing.T) {
+		nuc := newJWTTestUserClaims()
+		// Without clamping, int32(math.MaxInt32+1) wraps to MinInt32,
+		// making int64(size) > int64(negative) always true and rejecting
+		// all publishes and closing the connection.
+		nuc.Limits.Payload = math.MaxInt32 + 1
+		s, c, cr := setupJWTTestWithUserClaims(t, nuc, "+OK")
+		defer s.Shutdown()
+		defer c.close()
+
+		expectPong(t, cr)
+
+		// With clamping, publish should succeed.
+		// Before, this would have caused `-ERR 'Maximum Payload Violation'`
+		// then disconnect the client.
+		c.parseAsync("PUB baz 5\r\nhello\r\nPING\r\n")
+		l, _ := cr.ReadString('\n')
+		if !strings.HasPrefix(l, "+OK") {
+			t.Fatalf("Expected +OK, got %q", l)
+		}
+	})
+
+	t.Run("ScopedSigningKey", func(t *testing.T) {
+		// Without clamping in the scoped signing key path (client.go
+		// userScope.Template.Limits), int32 truncation of values >
+		// MaxInt32 would wrap to negative and reject all subs/publishes.
+		akp, _ := nkeys.CreateAccount()
+		apub, _ := akp.PublicKey()
+		nac := jwt.NewAccountClaims(apub)
+
+		// Create a scoped signing key with overflow limits.
+		skp, _ := nkeys.CreateAccount()
+		spub, _ := skp.PublicKey()
+		scope := jwt.NewUserScope()
+		scope.Key = spub
+		scope.Template.Limits.Subs = math.MaxInt32 + 1
+		scope.Template.Limits.Payload = math.MaxInt32 + 1
+		nac.SigningKeys.AddScopedSigner(scope)
+
+		ajwt, err := nac.Encode(oKp)
+		require_NoError(t, err)
+
+		// Create user signed by the scoped signing key.
+		// SetScoped(true) clears UserPermissionLimits so the
+		// scope template is used instead of user claims.
+		ukp, _ := nkeys.CreateUser()
+		upub, _ := ukp.PublicKey()
+		nuc := jwt.NewUserClaims(upub)
+		nuc.IssuerAccount = apub
+		nuc.SetScoped(true)
+		ujwt, err := nuc.Encode(skp)
+		require_NoError(t, err)
+
+		s := opTrustBasicSetup()
+		defer s.Shutdown()
+		buildMemAccResolver(s)
+		addAccountToMemResolver(s, apub, ajwt)
+
+		c, cr, l := newClientForServer(s)
+		defer c.close()
+
+		var info nonceInfo
+		json.Unmarshal([]byte(l[5:]), &info)
+		sigraw, _ := ukp.Sign([]byte(info.Nonce))
+		sig := base64.RawURLEncoding.EncodeToString(sigraw)
+
+		cs := fmt.Sprintf("CONNECT {\"jwt\":%q,\"sig\":\"%s\",\"verbose\":true,\"pedantic\":true}\r\nPING\r\n", ujwt, sig)
+		wg := sync.WaitGroup{}
+		wg.Add(1)
+		go func() {
+			c.parse([]byte(cs))
+			wg.Done()
+		}()
+		l, _ = cr.ReadString('\n')
+		if !strings.HasPrefix(l, "+OK") {
+			t.Fatalf("Expected +OK on CONNECT, got %q", l)
+		}
+		wg.Wait()
+		expectPong(t, cr)
+
+		// SUB must succeed — without clamping, msubs overflows to
+		// negative and subsAtLimit() always returns true.
+		c.parseAsync("SUB foo 1\r\nPING\r\n")
+		l, _ = cr.ReadString('\n')
+		if !strings.HasPrefix(l, "+OK") {
+			t.Fatalf("Expected +OK on SUB, got %q", l)
+		}
+		expectPong(t, cr)
+
+		// PUB must succeed — without clamping, mpay overflows to
+		// negative and the payload check always triggers.
+		c.parseAsync("PUB baz 5\r\nhello\r\nPING\r\n")
+		l, _ = cr.ReadString('\n')
+		if !strings.HasPrefix(l, "+OK") {
+			t.Fatalf("Expected +OK on PUB, got %q", l)
+		}
+	})
 }

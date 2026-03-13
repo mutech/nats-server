@@ -22047,29 +22047,112 @@ func TestJetStreamScheduledMessageNotDeactivated(t *testing.T) {
 
 func TestJetStreamScheduledMessageParse(t *testing.T) {
 	// @at <ts>
-	ts := time.Now().UTC()
-	sts, repeat, ok := parseMsgSchedule(fmt.Sprintf("@at %s", ts.Format(time.RFC3339Nano)), 0)
-	require_True(t, ok)
-	require_False(t, repeat)
-	require_Equal(t, ts, sts)
+	t.Run("@at", func(t *testing.T) {
+		ts := time.Now().UTC()
+		sts, repeat, ok := parseMsgSchedule(fmt.Sprintf("@at %s", ts.Format(time.RFC3339Nano)), _EMPTY_, 0)
+		require_True(t, ok)
+		require_False(t, repeat)
+		require_Equal(t, ts, sts)
+	})
 
 	// @every <duration>
-	now := time.Now().UTC().Round(time.Second)
-	sts, repeat, ok = parseMsgSchedule("@every 5s", now.UnixNano())
-	require_True(t, ok)
-	require_True(t, repeat)
-	require_Equal(t, now.Add(5*time.Second), sts)
+	t.Run("@every", func(t *testing.T) {
+		now := time.Now().UTC().Round(time.Second)
+		sts, repeat, ok := parseMsgSchedule("@every 5s", _EMPTY_, now.UnixNano())
+		require_True(t, ok)
+		require_True(t, repeat)
+		require_Equal(t, now.Add(5*time.Second), sts)
 
-	// A schedule on an interval should not spam loads of times if it hasn't run in a long while.
-	now = time.Now().UTC().Round(time.Second)
-	sts, repeat, ok = parseMsgSchedule("@every 5s", 0)
-	require_True(t, ok)
-	require_True(t, repeat)
-	require_True(t, !sts.Before(now.Add(5*time.Second)))
+		// A schedule on an interval should not spam loads of times if it hasn't run in a long while.
+		now = time.Now().UTC().Round(time.Second)
+		sts, repeat, ok = parseMsgSchedule("@every 5s", _EMPTY_, 0)
+		require_True(t, ok)
+		require_True(t, repeat)
+		require_True(t, !sts.Before(now.Add(5*time.Second)))
 
-	// A schedule can only run at least once every second.
-	_, _, ok = parseMsgSchedule("@every 999ms", 0)
-	require_False(t, ok)
+		// A schedule can only run at least once every second.
+		_, _, ok = parseMsgSchedule("@every 999ms", _EMPTY_, 0)
+		require_False(t, ok)
+	})
+
+	// <cron> pattern
+	t.Run("cron", func(t *testing.T) {
+		now := time.Now().UTC().Round(time.Second)
+		sts, repeat, ok := parseMsgSchedule("* * * * * *", _EMPTY_, now.UnixNano())
+		require_True(t, ok)
+		require_True(t, repeat)
+		require_Equal(t, now.Add(time.Second), sts)
+
+		// A schedule based on a cron should run the earliest "next" second.
+		now = time.Now().UTC().Truncate(time.Second).Add(time.Second - time.Nanosecond)
+		sts, repeat, ok = parseMsgSchedule("* * * * * *", _EMPTY_, now.UnixNano())
+		require_True(t, ok)
+		require_True(t, repeat)
+		require_Equal(t, now.Truncate(time.Second).Add(time.Second), sts)
+
+		// A schedule based on cron should not spam loads of times if it hasn't run in a long while.
+		now = time.Now().UTC().Round(time.Second)
+		sts, repeat, ok = parseMsgSchedule("* * * * * *", _EMPTY_, 0)
+		require_True(t, ok)
+		require_True(t, repeat)
+		require_True(t, !sts.Before(now.Add(time.Second)))
+
+		// Predefined cron patterns, e.g. @hourly.
+		for _, p := range []struct {
+			pattern string
+			delay   func(time.Time) time.Time
+		}{
+			{pattern: "@yearly", delay: func(t time.Time) time.Time {
+				return t.AddDate(1, 0, 0)
+			}},
+			{pattern: "@annually", delay: func(t time.Time) time.Time {
+				return t.AddDate(1, 0, 0)
+			}},
+			{pattern: "@monthly", delay: func(t time.Time) time.Time {
+				return t.AddDate(0, 1, 0)
+			}},
+			{pattern: "@weekly", delay: func(t time.Time) time.Time {
+				return t.AddDate(0, 0, 7)
+			}},
+			{pattern: "@daily", delay: func(t time.Time) time.Time {
+				return t.AddDate(0, 0, 1)
+			}},
+			{pattern: "@midnight", delay: func(t time.Time) time.Time {
+				return t.AddDate(0, 0, 1)
+			}},
+			{pattern: "@hourly", delay: func(t time.Time) time.Time {
+				return t.Add(time.Hour)
+			}},
+		} {
+			t.Run(p.pattern, func(t *testing.T) {
+				// Skip ahead "current time", so we can test the added delay is correct.
+				now = time.Date(time.Now().Year()+2, 1, 1, 0, 0, 0, 0, time.UTC)
+				// Also ensure we're on a Sunday of this month, to test "@weekly".
+				if p.pattern == "@weekly" {
+					for now.Weekday() != 0 {
+						now = now.AddDate(0, 0, 1)
+					}
+				}
+				sts, repeat, ok = parseMsgSchedule(p.pattern, _EMPTY_, now.UnixNano())
+				require_True(t, ok)
+				require_True(t, repeat)
+				require_Equal(t, p.delay(now), sts)
+			})
+		}
+	})
+
+	// <cron> pattern with time zone
+	t.Run("cron_tz", func(t *testing.T) {
+		tz := "Europe/Amsterdam"
+		loc, err := time.LoadLocation(tz)
+		require_NoError(t, err)
+
+		now := time.Now().UTC().Round(time.Second)
+		sts, repeat, ok := parseMsgSchedule("* * * * * *", tz, now.UnixNano())
+		require_True(t, ok)
+		require_True(t, repeat)
+		require_Equal(t, now.In(loc).Add(time.Second).String(), sts.String())
+	})
 }
 
 func TestJetStreamDirectGetBatchParallelWriteDeadlock(t *testing.T) {
@@ -22666,5 +22749,231 @@ func TestJetStreamFlowControlCrossAccountFanOut(t *testing.T) {
 		if maxpb <= pblimit/16 {
 			t.Fatalf("account %s: expected FC ramp-up (maxpb=%d > initial=%d)", accName, maxpb, pblimit/16)
 		}
+	}
+}
+
+func TestJetStreamStreamCheckSourcesWithExternal(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{Name: "ORIGIN"})
+	require_NoError(t, err)
+
+	// Specifying both fields errors.
+	src := &nats.StreamSource{
+		Name:          "ORIGIN",
+		FilterSubject: "filter",
+		SubjectTransforms: []nats.SubjectTransformConfig{
+			{Source: "filter"},
+		},
+	}
+	cfg := &nats.StreamConfig{Name: "SOURCE", Sources: []*nats.StreamSource{src}}
+	for _, external := range []*nats.ExternalStream{nil, {}} {
+		src.External = external
+		_, err = js.AddStream(cfg)
+		require_Error(t, err, NewJSSourceMultipleFiltersNotAllowedError())
+	}
+
+	// Invalid source subject errors.
+	src = &nats.StreamSource{
+		Name: "ORIGIN",
+		SubjectTransforms: []nats.SubjectTransformConfig{
+			{Source: ".invalid"},
+		},
+	}
+	cfg = &nats.StreamConfig{Name: "SOURCE", Sources: []*nats.StreamSource{src}}
+	for _, external := range []*nats.ExternalStream{nil, {}} {
+		src.External = external
+		_, err = js.AddStream(cfg)
+		require_Error(t, err, NewJSSourceInvalidSubjectFilterError(fmt.Errorf("%w %s", ErrBadSubject, ".invalid")))
+	}
+
+	// Invalid destination subject errors.
+	src = &nats.StreamSource{
+		Name: "ORIGIN",
+		SubjectTransforms: []nats.SubjectTransformConfig{
+			{Source: "src", Destination: ".invalid"},
+		},
+	}
+	cfg = &nats.StreamConfig{Name: "SOURCE", Sources: []*nats.StreamSource{src}}
+	for _, external := range []*nats.ExternalStream{nil, {}} {
+		src.External = external
+		_, err = js.AddStream(cfg)
+		require_Error(t, err, NewJSSourceInvalidTransformDestinationError(ErrInvalidMappingDestinationSubject))
+	}
+
+	// Overlap errors.
+	src = &nats.StreamSource{
+		Name: "ORIGIN",
+		SubjectTransforms: []nats.SubjectTransformConfig{
+			{Source: "src"},
+			{Source: "src"},
+		},
+	}
+	cfg = &nats.StreamConfig{Name: "SOURCE", Sources: []*nats.StreamSource{src}}
+	for _, external := range []*nats.ExternalStream{nil, {}} {
+		src.External = external
+		_, err = js.AddStream(cfg)
+		require_Error(t, err, NewJSSourceOverlappingSubjectFiltersError())
+	}
+}
+
+func TestJetStreamMirrorProcessMsgsNilQuitChannel(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+	})
+	require_NoError(t, err)
+
+	_, err = js.AddStream(&nats.StreamConfig{
+		Name:   "MIRROR",
+		Mirror: &nats.StreamSource{Name: "TEST"},
+	})
+	require_NoError(t, err)
+
+	// Verify the mirror works.
+	_, err = js.Publish("foo", []byte("hello"))
+	require_NoError(t, err)
+	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		si, err := js.StreamInfo("MIRROR")
+		if err != nil {
+			return err
+		}
+		if si.State.Msgs != 1 {
+			return fmt.Errorf("expected 1 msg, got %d", si.State.Msgs)
+		}
+		return nil
+	})
+
+	mset, err := s.globalAccount().lookupStream("MIRROR")
+	require_NoError(t, err)
+
+	// Cancel the current mirror consumer and wait for its processMirrorMsgs
+	// goroutine to fully exit.
+	mset.mu.Lock()
+	mset.cancelMirrorConsumer()
+	mirror := mset.mirror
+	mset.mu.Unlock()
+	mirror.wg.Wait()
+
+	// Now reproduce the race condition: start processMirrorMsgs while
+	// mirror.qch is nil. This simulates what happens when cancelSourceInfo
+	// runs between the goroutine being launched and acquiring mset.mu.
+	//
+	// We hold mset.mu while starting the goroutine so that it blocks on
+	// mset.mu.Lock() inside processMirrorMsgs. When we release the lock,
+	// it captures siqch = mirror.qch which is nil (left nil by cancelSourceInfo).
+	mset.mu.Lock()
+	mirror = mset.mirror
+	mirror.msgs = newIPQueue[*inMsg](s, "stream mirror")
+	mirror.wg.Add(1)
+	ready := sync.WaitGroup{}
+	ready.Add(1)
+	if !s.startGoRoutine(func() { mset.processMirrorMsgs(mirror, &ready) }) {
+		mirror.wg.Done()
+		ready.Done()
+		mset.mu.Unlock()
+		t.Fatal("Failed to start goroutine")
+	}
+	mset.mu.Unlock()
+	ready.Wait()
+
+	// Verify the goroutine exits promptly. With the bug, mirror.wg.Wait()
+	// blocks forever because <-siqch on a nil channel never fires.
+	done := make(chan struct{})
+	go func() {
+		mirror.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Expected goroutine to exit properly after cancel.
+	case <-time.After(2 * time.Second):
+		t.Fatal("Mirror goroutine did not exit after cancel: stuck on nil quit channel")
+	}
+}
+
+func TestJetStreamMirrorSetupStartGoRoutineFailMissingWgDone(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+	})
+	require_NoError(t, err)
+
+	_, err = js.AddStream(&nats.StreamConfig{
+		Name:   "MIRROR",
+		Mirror: &nats.StreamSource{Name: "TEST"},
+	})
+	require_NoError(t, err)
+
+	// Verify the mirror works.
+	_, err = js.Publish("foo", []byte("hello"))
+	require_NoError(t, err)
+	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		si, err := js.StreamInfo("MIRROR")
+		if err != nil {
+			return err
+		}
+		if si.State.Msgs != 1 {
+			return fmt.Errorf("expected 1 msg, got %d", si.State.Msgs)
+		}
+		return nil
+	})
+
+	mset, err := s.globalAccount().lookupStream("MIRROR")
+	require_NoError(t, err)
+
+	// Cancel the current mirror consumer and wait for its goroutine to exit.
+	mset.mu.Lock()
+	mset.cancelMirrorConsumer()
+	mirror := mset.mirror
+	mset.mu.Unlock()
+	mirror.wg.Wait()
+
+	// Simulate shutting down and not able to schedule more goroutines.
+	s.grMu.Lock()
+	s.grRunning = false
+	s.grMu.Unlock()
+
+	// Set up the mirror consumer which should not allow a new goroutine to be scheduled.
+	mset.mu.Lock()
+	mirror.lreq = time.Time{}
+	err = mset.setupMirrorConsumer()
+	mset.mu.Unlock()
+	require_NoError(t, err)
+
+	// Give the above setup enough time to start the mirror goroutine.
+	time.Sleep(500 * time.Millisecond)
+
+	done := make(chan struct{})
+	go func() {
+		mirror.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Expected goroutine to exit properly.
+	case <-time.After(2 * time.Second):
+		// wg is stuck because Done() was never called.
+		// Clean up the orphaned wg to prevent leaking the waiter goroutine.
+		mirror.wg.Done()
+		t.Fatal("mirror.wg.Wait() blocked indefinitely: missing wg.Done() in startGoRoutine failure path")
 	}
 }

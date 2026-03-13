@@ -5626,7 +5626,6 @@ func (fs *fileStore) removeMsg(seq uint64, secure, viaLimits, needFSLock bool) (
 	}
 	// Always return previous write errors.
 	if err := fs.werr; err != nil {
-		fsUnlock()
 		return false, err
 	}
 	// If in encrypted mode negate secure rewrite here.
@@ -9752,11 +9751,6 @@ func (fs *fileStore) purge(fseq uint64) (purged uint64, rerr error) {
 	if fs.isClosed() {
 		return 0, ErrStoreClosed
 	}
-	// Always return previous write errors.
-	if err := fs.werr; err != nil {
-		fs.mu.Unlock()
-		return 0, err
-	}
 
 	// Persist any write errors.
 	defer func() {
@@ -9768,6 +9762,12 @@ func (fs *fileStore) purge(fseq uint64) (purged uint64, rerr error) {
 	}()
 
 	fs.mu.Lock()
+
+	// Always return previous write errors.
+	if err := fs.werr; err != nil {
+		fs.mu.Unlock()
+		return 0, err
+	}
 
 	purged = fs.state.Msgs
 	rbytes := int64(fs.state.Bytes)
@@ -11130,6 +11130,29 @@ func (fs *fileStore) populateGlobalPerSubjectInfo(mb *msgBlock) error {
 	return nil
 }
 
+// Calls os.RemoveAll on the given `dir` directory, but if an error occurs,
+// retries up to one second. If that still fails, returns the last error
+// that os.RemoveAll returned.
+func removeAllWithRetry(dir string) error {
+	<-dios
+	err := os.RemoveAll(dir)
+	dios <- struct{}{}
+	if err == nil {
+		return nil
+	}
+	ttl := time.Now().Add(time.Second)
+	for time.Now().Before(ttl) {
+		time.Sleep(10 * time.Millisecond)
+		<-dios
+		err = os.RemoveAll(dir)
+		dios <- struct{}{}
+		if err == nil {
+			return nil
+		}
+	}
+	return err
+}
+
 // Close the message block.
 func (mb *msgBlock) close(sync bool) {
 	if mb == nil {
@@ -11230,28 +11253,12 @@ func (fs *fileStore) Delete(inline bool) error {
 	}
 	// Do this in separate Go routine in case lots of blocks.
 	// Purge above protects us as does the removal of meta artifacts above.
-	removeDir := func() {
-		<-dios
-		err := os.RemoveAll(ndir)
-		dios <- struct{}{}
-		if err == nil {
-			return
-		}
-		ttl := time.Now().Add(time.Second)
-		for time.Now().Before(ttl) {
-			time.Sleep(10 * time.Millisecond)
-			<-dios
-			err = os.RemoveAll(ndir)
-			dios <- struct{}{}
-			if err == nil {
-				return
-			}
-		}
-	}
 	if inline {
-		removeDir()
+		if err := removeAllWithRetry(ndir); err != nil {
+			return err
+		}
 	} else {
-		go removeDir()
+		go removeAllWithRetry(ndir)
 	}
 	return nil
 }
@@ -12677,7 +12684,7 @@ func (o *consumerFileStore) Update(state *ConsumerState) error {
 
 	// Check to see if this is an outdated update.
 	if state.Delivered.Consumer < o.state.Delivered.Consumer || state.AckFloor.Stream < o.state.AckFloor.Stream {
-		return fmt.Errorf("old update ignored")
+		return ErrStoreOldUpdate
 	}
 
 	o.state.Delivered = state.Delivered
@@ -13208,7 +13215,6 @@ func (o *consumerFileStore) delete(streamDeleted bool) error {
 		o.qch = nil
 	}
 
-	var err error
 	odir := o.odir
 	o.odir = _EMPTY_
 	o.closed = true
@@ -13217,21 +13223,18 @@ func (o *consumerFileStore) delete(streamDeleted bool) error {
 
 	// If our stream was not deleted this will remove the directories.
 	if odir != _EMPTY_ && !streamDeleted {
-		<-dios
-		err = os.RemoveAll(odir)
-		dios <- struct{}{}
-		if err != nil {
+		if err := removeAllWithRetry(odir); err != nil {
 			return err
 		}
 	}
 
 	if !streamDeleted {
-		if err = fs.RemoveConsumer(o); err != nil {
+		if err := fs.RemoveConsumer(o); err != nil {
 			return err
 		}
 	}
 
-	return err
+	return nil
 }
 
 func (fs *fileStore) AddConsumer(o ConsumerStore) error {
@@ -13368,6 +13371,10 @@ func writeFileWithSync(name string, data []byte, perm fs.FileMode) error {
 	return writeAtomically(name, data, perm, true)
 }
 
+// Windows does not support fsyncing directory metadata, it results in a panic, so
+// we need to skip doing this there.
+const canFsyncDirectories = runtime.GOOS != "windows"
+
 func writeAtomically(name string, data []byte, perm fs.FileMode, sync bool) error {
 	tmp := name + ".tmp"
 	flags := os.O_CREATE | os.O_WRONLY | os.O_TRUNC
@@ -13396,7 +13403,7 @@ func writeAtomically(name string, data []byte, perm fs.FileMode, sync bool) erro
 		_ = os.Remove(tmp)
 		return err
 	}
-	if sync {
+	if sync && canFsyncDirectories {
 		// To ensure that the file rename was persisted on all filesystems,
 		// also try to flush the directory metadata.
 		var d *os.File
