@@ -3026,7 +3026,7 @@ func (mset *stream) processInboundMirrorMsg(m *inMsg) bool {
 	if err != nil {
 		if strings.Contains(err.Error(), "no space left") {
 			s.Errorf("JetStream out of space, will be DISABLED")
-			s.DisableJetStream()
+			s.ShutdownJetStream()
 			return false
 		}
 		if err != errLastSeqMismatch {
@@ -4034,7 +4034,7 @@ func (mset *stream) processInboundSourceMsg(si *sourceInfo, m *inMsg) bool {
 		s := mset.srv
 		if strings.Contains(err.Error(), "no space left") {
 			s.Errorf("JetStream out of space, will be DISABLED")
-			s.DisableJetStream()
+			s.ShutdownJetStream()
 		} else {
 			mset.mu.RLock()
 			accName, sname, iName := mset.acc.Name, mset.cfg.Name, si.iname
@@ -6217,7 +6217,7 @@ func (mset *stream) processJetStreamMsg(subject, reply string, hdr, msg []byte, 
 		if isPermissionError(err) {
 			// messages in block cache could be lost in the worst case.
 			// In the clustered mode it is very highly unlikely as a result of replication.
-			go mset.srv.DisableJetStream()
+			go mset.srv.ShutdownJetStream()
 			mset.srv.Warnf("Filesystem permission denied while writing msg, disabling JetStream: %v", err)
 			return err
 		}

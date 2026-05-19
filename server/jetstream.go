@@ -573,7 +573,7 @@ func (s *Server) restartJetStream() error {
 	err := s.EnableJetStream(&cfg)
 	if err != nil {
 		s.Warnf("Can't start JetStream: %v", err)
-		return s.DisableJetStream()
+		return s.ShutdownJetStream()
 	}
 	s.updateJetStreamInfoStatus(true)
 	return nil
@@ -625,7 +625,7 @@ func (s *Server) handleOutOfSpace(mset *stream) {
 			s.Errorf("JetStream out of resources, will be DISABLED")
 		}
 
-		go s.DisableJetStream()
+		go s.ShutdownJetStream()
 
 		adv := &JSServerOutOfSpaceAdvisory{
 			TypedEvent: TypedEvent{
@@ -644,8 +644,23 @@ func (s *Server) handleOutOfSpace(mset *stream) {
 }
 
 // DisableJetStream will turn off JetStream and signals in clustered mode
-// to have the metacontroller remove us from the peer list.
+// to have the metacontroller remove us from the peer list. Persistent
+// meta-raft state on disk is removed. For transient runtime errors where
+// the server should rejoin its existing meta group on restart, use
+// ShutdownJetStream instead.
 func (s *Server) DisableJetStream() error {
+	return s.disableJetStream(true)
+}
+
+// ShutdownJetStream is like DisableJetStream but preserves persistent
+// meta-raft state on disk so the server can rejoin the existing meta
+// group on restart. Use for transient runtime errors that the operator
+// is expected to fix before restarting.
+func (s *Server) ShutdownJetStream() error {
+	return s.disableJetStream(false)
+}
+
+func (s *Server) disableJetStream(deleteState bool) error {
 	if !s.JetStreamEnabled() {
 		return nil
 	}
@@ -676,7 +691,12 @@ func (s *Server) DisableJetStream() error {
 					s.Warnf("JetStream timeout waiting for meta leader transfer")
 				}
 			}
-			meta.Delete()
+			if deleteState {
+				meta.Delete()
+			} else {
+				meta.Stop()
+				meta.WaitForStop()
+			}
 		}
 	}
 
@@ -3265,7 +3285,7 @@ func (s *Server) handleWritePermissionError() {
 	if s.JetStreamEnabled() {
 		s.Errorf("File system permission denied while writing, disabling JetStream")
 
-		go s.DisableJetStream()
+		go s.ShutdownJetStream()
 
 		//TODO Send respective advisory if needed, same as in handleOutOfSpace
 	}
