@@ -972,11 +972,11 @@ func (c *client) applyAccountLimits() {
 	}
 	wasUnlimited := c.mpay == jwt.NoLimit
 	if minLimit(&c.mpay, mPay) && !wasUnlimited {
-		c.Errorf("Max Payload set to %d from server overrides account or user config", opts.MaxPayload)
+		c.Debugf("Max Payload set to %d from server overrides account or user config", opts.MaxPayload)
 	}
 	wasUnlimited = c.msubs == jwt.NoLimit
 	if minLimit(&c.msubs, mSubs) && !wasUnlimited {
-		c.Errorf("Max Subscriptions set to %d from server overrides account or user config", opts.MaxSubs)
+		c.Debugf("Max Subscriptions set to %d from server overrides account or user config", opts.MaxSubs)
 	}
 	if c.subsAtLimit() {
 		go func() {
@@ -1050,6 +1050,24 @@ func (c *client) RegisterNkeyUser(user *NkeyUser) error {
 	}
 	c.mu.Unlock()
 	return nil
+}
+
+func (c *client) updateDefaultPermissions(perms *Permissions) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.user == nil || !c.user.defaultPerms {
+		return false
+	}
+	if perms == nil {
+		c.user.Permissions = nil
+		c.perms = nil
+		c.mperms = nil
+		c.darray = nil
+		return true
+	}
+	c.user.Permissions = perms.clone()
+	c.setPermissions(c.user.Permissions)
+	return true
 }
 
 func splitSubjectQueue(sq string) ([]byte, []byte, error) {

@@ -7371,8 +7371,8 @@ func TestJetStreamClusterStreamHealthCheckMustNotRecreate(t *testing.T) {
 		require_NotNil(t, err)
 
 		sjs := rs.getJetStream()
-		sjs.mu.RLock()
-		defer sjs.mu.RUnlock()
+		sjs.mu.Lock()
+		defer sjs.mu.Unlock()
 
 		sas := sjs.cluster.streams[globalAccountName]
 		require_True(t, sas != nil)
@@ -7477,8 +7477,8 @@ func TestJetStreamClusterStreamHealthCheckMustNotDeleteEarly(t *testing.T) {
 		require_NotNil(t, err)
 
 		sjs := rs.getJetStream()
-		sjs.mu.RLock()
-		defer sjs.mu.RUnlock()
+		sjs.mu.Lock()
+		defer sjs.mu.Unlock()
 
 		sas := sjs.cluster.streams[globalAccountName]
 		require_True(t, sas != nil)
@@ -7551,8 +7551,8 @@ func TestJetStreamClusterStreamHealthCheckOnlyReportsSkew(t *testing.T) {
 		require_NotNil(t, err)
 
 		sjs := rs.getJetStream()
-		sjs.mu.RLock()
-		defer sjs.mu.RUnlock()
+		sjs.mu.Lock()
+		defer sjs.mu.Unlock()
 
 		sas := sjs.cluster.streams[globalAccountName]
 		require_True(t, sas != nil)
@@ -7652,9 +7652,13 @@ func TestJetStreamClusterConsumerHealthCheckMustNotRecreate(t *testing.T) {
 
 	waitForConsumerAssignments := func() {
 		t.Helper()
-		checkFor(t, 5*time.Second, time.Second, func() error {
+		checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
 			for _, s := range c.servers {
-				if s.getJetStream().consumerAssignment(globalAccountName, "TEST", "CONSUMER") == nil {
+				sjs := s.getJetStream()
+				sjs.mu.RLock()
+				ca := sjs.consumerAssignment(globalAccountName, "TEST", "CONSUMER")
+				sjs.mu.RUnlock()
+				if ca == nil {
 					return fmt.Errorf("stream assignment not found on %s", s.Name())
 				}
 			}
@@ -7663,9 +7667,13 @@ func TestJetStreamClusterConsumerHealthCheckMustNotRecreate(t *testing.T) {
 	}
 	waitForNoConsumerAssignments := func() {
 		t.Helper()
-		checkFor(t, 5*time.Second, time.Second, func() error {
+		checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
 			for _, s := range c.servers {
-				if s.getJetStream().consumerAssignment(globalAccountName, "TEST", "CONSUMER") != nil {
+				sjs := s.getJetStream()
+				sjs.mu.RLock()
+				ca := sjs.consumerAssignment(globalAccountName, "TEST", "CONSUMER")
+				sjs.mu.RUnlock()
+				if ca != nil {
 					return fmt.Errorf("stream assignment still available on %s", s.Name())
 				}
 			}
@@ -7679,8 +7687,8 @@ func TestJetStreamClusterConsumerHealthCheckMustNotRecreate(t *testing.T) {
 		require_NotNil(t, err)
 
 		sjs := rs.getJetStream()
-		sjs.mu.RLock()
-		defer sjs.mu.RUnlock()
+		sjs.mu.Lock()
+		defer sjs.mu.Unlock()
 
 		sas := sjs.cluster.streams[globalAccountName]
 		require_True(t, sas != nil)
@@ -7720,6 +7728,15 @@ func TestJetStreamClusterConsumerHealthCheckMustNotRecreate(t *testing.T) {
 	n := rg.node
 	n.Stop()
 	n.WaitForStop()
+
+	o := mset.lookupConsumer("CONSUMER")
+	require_NotNil(t, o)
+	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+		if o.isMonitorRunning() {
+			return errors.New("monitor goroutine still running")
+		}
+		return nil
+	})
 
 	// The RAFT node should be closed. Checking health must not change that.
 	// Simulates a race condition where we're shutting down.
@@ -7769,7 +7786,11 @@ func TestJetStreamClusterConsumerHealthCheckMustNotDeleteEarly(t *testing.T) {
 		t.Helper()
 		checkFor(t, 5*time.Second, time.Second, func() error {
 			for _, s := range c.servers {
-				if s.getJetStream().consumerAssignment(globalAccountName, "TEST", "CONSUMER") == nil {
+				sjs := s.getJetStream()
+				sjs.mu.RLock()
+				ca := sjs.consumerAssignment(globalAccountName, "TEST", "CONSUMER")
+				sjs.mu.RUnlock()
+				if ca == nil {
 					return fmt.Errorf("stream assignment not found on %s", s.Name())
 				}
 			}
@@ -7784,8 +7805,8 @@ func TestJetStreamClusterConsumerHealthCheckMustNotDeleteEarly(t *testing.T) {
 		o := mset.lookupConsumer("CONSUMER")
 
 		sjs := rs.getJetStream()
-		sjs.mu.RLock()
-		defer sjs.mu.RUnlock()
+		sjs.mu.Lock()
+		defer sjs.mu.Unlock()
 
 		sas := sjs.cluster.streams[globalAccountName]
 		require_True(t, sas != nil)
@@ -7845,7 +7866,11 @@ func TestJetStreamClusterConsumerHealthCheckOnlyReportsSkew(t *testing.T) {
 		t.Helper()
 		checkFor(t, 5*time.Second, time.Second, func() error {
 			for _, s := range c.servers {
-				if s.getJetStream().consumerAssignment(globalAccountName, "TEST", "CONSUMER") == nil {
+				sjs := s.getJetStream()
+				sjs.mu.RLock()
+				ca := sjs.consumerAssignment(globalAccountName, "TEST", "CONSUMER")
+				sjs.mu.RUnlock()
+				if ca == nil {
 					return fmt.Errorf("stream assignment not found on %s", s.Name())
 				}
 			}
@@ -7860,8 +7885,8 @@ func TestJetStreamClusterConsumerHealthCheckOnlyReportsSkew(t *testing.T) {
 		o := mset.lookupConsumer("CONSUMER")
 
 		sjs := rs.getJetStream()
-		sjs.mu.RLock()
-		defer sjs.mu.RUnlock()
+		sjs.mu.Lock()
+		defer sjs.mu.Unlock()
 
 		sas := sjs.cluster.streams[globalAccountName]
 		require_True(t, sas != nil)
@@ -8053,6 +8078,197 @@ func TestJetStreamClusterConsumerHealthCheckSurfacesAssignmentErr(t *testing.T) 
 	ca.err = nil
 	sjs.mu.Unlock()
 	require_NoError(t, sjs.isConsumerHealthy(mset, "CONSUMER", ca))
+}
+
+func TestJetStreamClusterProcessStreamAssignmentResults(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	// The result handler runs on the metadata leader.
+	ml := c.leader()
+	require_NotNil(t, ml)
+	mjs := ml.getJetStream()
+
+	// Malformed payloads and unknown accounts are dropped silently.
+	mjs.processStreamAssignmentResults(nil, nil, nil, _EMPTY_, _EMPTY_, []byte("{not-json"))
+	badAcc, err := json.Marshal(&streamAssignmentResult{Account: "DOES_NOT_EXIST", Stream: "TEST"})
+	require_NoError(t, err)
+	mjs.processStreamAssignmentResults(nil, nil, nil, _EMPTY_, _EMPTY_, badAcc)
+
+	// Reset the assignment so it's treated as not-yet-responded, and ensure we're
+	// inside the canDelete window.
+	mjs.mu.Lock()
+	sa := mjs.streamAssignment(globalAccountName, "TEST")
+	require_True(t, sa != nil)
+	sa.clearResponded()
+	sa.Created = time.Now()
+	mjs.mu.Unlock()
+
+	// Craft a rejection result, as a member sends after a failed local create.
+	result := &streamAssignmentResult{
+		Account: globalAccountName,
+		Stream:  "TEST",
+		Response: &JSApiStreamCreateResponse{
+			ApiResponse: ApiResponse{
+				Type:  JSApiStreamCreateResponseType,
+				Error: NewJSStreamLimitsError(errors.New("synthetic limits error")),
+			},
+		},
+	}
+	b, err := json.Marshal(result)
+	require_NoError(t, err)
+	mjs.processStreamAssignmentResults(nil, nil, nil, _EMPTY_, _EMPTY_, b)
+
+	// The handler forwards the response, so the assignment is now marked responded.
+	mjs.mu.Lock()
+	responded := sa.hasResponded()
+	mjs.mu.Unlock()
+	require_True(t, responded)
+
+	// The rejected assignment must be cleaned up from the meta layer.
+	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		mjs.mu.Lock()
+		sa := mjs.streamAssignment(globalAccountName, "TEST")
+		mjs.mu.Unlock()
+		if sa != nil {
+			return fmt.Errorf("stream assignment still present")
+		}
+		return nil
+	})
+}
+
+func TestJetStreamClusterProcessStreamAssignmentResultsRetry(t *testing.T) {
+	sc := createJetStreamSuperCluster(t, 3, 2)
+	defer sc.shutdown()
+
+	nc, js := jsClientConnect(t, sc.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	ml := sc.leader()
+	require_NotNil(t, ml)
+	mjs := ml.getJetStream()
+
+	// Determine the assigned cluster and an alternate to retry into.
+	mjs.mu.Lock()
+	sa := mjs.streamAssignment(globalAccountName, "TEST")
+	require_True(t, sa != nil)
+	assignedCluster := sa.Client.Cluster
+	var alternate string
+	for _, cl := range sc.clusters {
+		if cl.name != assignedCluster {
+			alternate = cl.name
+			break
+		}
+	}
+	// Prepare the assignment so the retry branch is eligible: fresh, unresponded,
+	// no fixed placement, and with an alternate cluster to fall back to.
+	sa.clearResponded()
+	sa.Created = time.Now()
+	sa.Config.Placement = nil
+	sa.Client.Alternates = []string{alternate}
+	mjs.mu.Unlock()
+	require_NotEqual(t, alternate, _EMPTY_)
+
+	// Craft an insufficient-resources rejection.
+	result := &streamAssignmentResult{
+		Account: globalAccountName,
+		Stream:  "TEST",
+		Response: &JSApiStreamCreateResponse{
+			ApiResponse: ApiResponse{
+				Type:  JSApiStreamCreateResponseType,
+				Error: NewJSInsufficientResourcesError(),
+			},
+		},
+	}
+	b, err := json.Marshal(result)
+	require_NoError(t, err)
+
+	mjs.processStreamAssignmentResults(nil, nil, nil, _EMPTY_, _EMPTY_, b)
+
+	// The retry branch re-proposes the assignment and flags it as reassigning.
+	mjs.mu.Lock()
+	nsa := mjs.streamAssignmentOrInflight(globalAccountName, "TEST")
+	responded := nsa.hasResponded()
+	reassigning := nsa.reassigning
+	mjs.mu.Unlock()
+	// Retry returns before responding, so the client is not told it failed.
+	require_False(t, responded)
+	require_True(t, reassigning)
+}
+
+func TestJetStreamClusterProcessConsumerAssignmentResults(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{Durable: "CONSUMER"})
+	require_NoError(t, err)
+
+	ml := c.leader()
+	require_NotNil(t, ml)
+	mjs := ml.getJetStream()
+
+	// Malformed payloads and unknown accounts are dropped silently.
+	mjs.processConsumerAssignmentResults(nil, nil, nil, _EMPTY_, _EMPTY_, []byte("{not-json"))
+	badAcc, err := json.Marshal(&consumerAssignmentResult{Account: "DOES_NOT_EXIST", Stream: "TEST", Consumer: "CONSUMER"})
+	require_NoError(t, err)
+	mjs.processConsumerAssignmentResults(nil, nil, nil, _EMPTY_, _EMPTY_, badAcc)
+
+	mjs.mu.Lock()
+	ca := mjs.consumerAssignment(globalAccountName, "TEST", "CONSUMER")
+	require_True(t, ca != nil)
+	ca.clearResponded()
+	ca.Created = time.Now()
+	mjs.mu.Unlock()
+
+	result := &consumerAssignmentResult{
+		Account:  globalAccountName,
+		Stream:   "TEST",
+		Consumer: "CONSUMER",
+		Response: &JSApiConsumerCreateResponse{
+			ApiResponse: ApiResponse{
+				Type:  JSApiConsumerCreateResponseType,
+				Error: NewJSConsumerStoreFailedError(errors.New("synthetic store error")),
+			},
+		},
+	}
+	b, err := json.Marshal(result)
+	require_NoError(t, err)
+	mjs.processConsumerAssignmentResults(nil, nil, nil, _EMPTY_, _EMPTY_, b)
+
+	// The handler is synchronous: the assignment must now be marked responded and
+	// carry the recorded assignment-level error.
+	mjs.mu.Lock()
+	responded := ca.hasResponded()
+	caErr := ca.err
+	mjs.mu.Unlock()
+	require_True(t, responded)
+	require_Error(t, caErr, NewJSClusterNotAssignedError())
 }
 
 func TestJetStreamClusterStreamHealthCheckRecoversAfterSuccessfulUpdate(t *testing.T) {
@@ -11943,7 +12159,11 @@ func TestJetStreamClusterMetaRecoveryRecreateConsumer(t *testing.T) {
 		if newConsumer {
 			// Need to wait for the consumer to be deleted on our selected server.
 			checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
-				if rs.getJetStream().consumerAssignment(globalAccountName, "TEST", "CONSUMER") != nil {
+				sjs := rs.getJetStream()
+				sjs.mu.RLock()
+				ca := sjs.consumerAssignment(globalAccountName, "TEST", "CONSUMER")
+				sjs.mu.RUnlock()
+				if ca != nil {
 					return errors.New("still assigned")
 				}
 				return nil
@@ -12344,6 +12564,134 @@ func TestJetStreamClusterStreamPeerRemovePeerSetDesync(t *testing.T) {
 		}
 		return nil
 	})
+}
+
+func TestJetStreamClusterMalformedEntrySetsWriteErr(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	// Confirm the stream is healthy and has no write error to begin with.
+	_, err = js.Publish("foo", []byte("ok"))
+	require_NoError(t, err)
+
+	sl := c.streamLeader(globalAccountName, "TEST")
+	mset, err := sl.globalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+	require_NoError(t, mset.getWriteErr())
+
+	// Craft a malformed streamMsgOp, this must surface as a stream write error.
+	bad := append([]byte{byte(streamMsgOp)}, 1, 2, 3)
+	n := mset.raftNode().(*raft)
+	n.sendAppendEntry([]*Entry{newEntry(EntryNormal, bad)})
+
+	checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+		werr := mset.getWriteErr()
+		if werr == nil {
+			return fmt.Errorf("stream write error not set yet")
+		}
+		require_Error(t, werr, errBadStreamMsg)
+		return nil
+	})
+
+	// Sanity: the server must still be running (no panic took it down).
+	require_True(t, sl.Running())
+}
+
+func TestJetStreamClusterMalformedConsumerEntrySetsWriteErr(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Durable:   "CONS",
+		AckPolicy: nats.AckExplicitPolicy,
+		Replicas:  3,
+	})
+	require_NoError(t, err)
+
+	// Confirm the consumer is healthy and has no write error to begin with.
+	cl := c.consumerLeader(globalAccountName, "TEST", "CONS")
+	mset, err := cl.globalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+	o := mset.lookupConsumer("CONS")
+	require_True(t, o != nil)
+	require_NoError(t, o.getWriteErr())
+
+	cjs := cl.getJetStream()
+	ca := o.consumerAssignment()
+	require_NoError(t, cjs.isConsumerHealthy(mset, "CONS", ca))
+
+	// Craft a malformed consumer entry using an unknown op, this must surface as a consumer write error.
+	bad := []byte{255, 1, 2, 3}
+	n := o.raftNode().(*raft)
+	n.sendAppendEntry([]*Entry{newEntry(EntryNormal, bad)})
+
+	checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+		werr := o.getWriteErr()
+		if werr == nil {
+			return fmt.Errorf("consumer write error not set yet")
+		}
+		// Healthz must now reflect the broken state.
+		if err := cjs.isConsumerHealthy(mset, "CONS", ca); err == nil {
+			return fmt.Errorf("consumer still reported healthy")
+		}
+		return nil
+	})
+
+	// Sanity: the server must still be running (no panic took it down).
+	require_True(t, cl.Running())
+}
+
+func TestJetStreamClusterMalformedMetaEntrySetsWriteErr(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	// Confirm the meta group is healthy and has no write error to begin with.
+	ml := c.leader()
+	require_True(t, ml != nil)
+	mjs := ml.getJetStream()
+	require_True(t, mjs != nil)
+	require_NoError(t, mjs.getMetaWriteErr())
+	require_Equal(t, ml.healthz(nil).Error, _EMPTY_)
+
+	// Craft a malformed meta entry using an unknown op, this must surface as a meta write error.
+	bad := []byte{255, 1, 2, 3}
+	n := mjs.getMetaGroup().(*raft)
+	n.sendAppendEntry([]*Entry{newEntry(EntryNormal, bad)})
+
+	checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+		werr := mjs.getMetaWriteErr()
+		if werr == nil {
+			return fmt.Errorf("meta write error not set yet")
+		}
+		// Healthz must now reflect the broken state.
+		if hs := ml.healthz(nil); hs.Error == _EMPTY_ {
+			return fmt.Errorf("meta group still reported healthy")
+		}
+		return nil
+	})
+
+	// Sanity: the server must still be running (no panic took it down).
+	require_True(t, ml.Running())
 }
 
 //
