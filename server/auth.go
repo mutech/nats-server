@@ -854,11 +854,17 @@ func (s *Server) processClientOrLeafAuthentication(c *client, opts *Options) (au
 		pinnedAcounts = opts.resolverPinnedAccounts
 	}
 
+	// A UDS peer is identified by its kernel-verified peer credentials and is not
+	// anonymous, so no_auth_user — a default identity for credential-less TCP
+	// connections — must not shadow UDS peer-cred authentication. Defaults for
+	// unmatched UDS peers are expressed as catch-all UDS rules instead.
+	udsPeerCredAuth := c.isUDSPeer() && s.hasUDSPeerCredentialSupport()
+
 	// Check if we have nkeys or users for client.
 	hasNkeys := len(s.nkeys) > 0
 	hasUsers := len(s.users) > 0
 	if hasNkeys {
-		if (c.kind == CLIENT || c.kind == LEAF) && noAuthUser != _EMPTY_ &&
+		if (c.kind == CLIENT || c.kind == LEAF) && noAuthUser != _EMPTY_ && !udsPeerCredAuth &&
 			c.opts.Username == _EMPTY_ && c.opts.Password == _EMPTY_ && c.opts.Token == _EMPTY_ && c.opts.Nkey == _EMPTY_ {
 			if _, exists := s.nkeys[noAuthUser]; exists {
 				c.mu.Lock()
@@ -936,7 +942,7 @@ func (s *Server) processClientOrLeafAuthentication(c *client, opts *Options) (au
 			// but we set it here to be able to identify it in the logs.
 			c.opts.Username = user.Username
 		} else {
-			if (c.kind == CLIENT || c.kind == LEAF) && noAuthUser != _EMPTY_ &&
+			if (c.kind == CLIENT || c.kind == LEAF) && noAuthUser != _EMPTY_ && !udsPeerCredAuth &&
 				c.opts.Username == _EMPTY_ && c.opts.Password == _EMPTY_ && c.opts.Token == _EMPTY_ {
 				if u, exists := s.users[noAuthUser]; exists {
 					c.mu.Lock()
@@ -1225,10 +1231,18 @@ func (s *Server) processClientOrLeafAuthentication(c *client, opts *Options) (au
 			return false
 		}
 
-		// Register with account and set permissions
+		// Register with account and set permissions. authResult.account is the
+		// account copy stored in options (its sublist is cleared once the live
+		// server account is built), so resolve the live account by name before
+		// registering — mirroring how configured users are bound above.
 		if authResult.account != nil {
-			if err := c.registerWithAccount(authResult.account); err != nil {
+			acc, err := s.lookupAccount(authResult.account.Name)
+			if err != nil {
 				c.reportErrRegisterAccount(authResult.account, err)
+				return false
+			}
+			if err := c.registerWithAccount(acc); err != nil {
+				c.reportErrRegisterAccount(acc, err)
 				return false
 			}
 		}

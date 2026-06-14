@@ -377,6 +377,186 @@ func TestUDS_Auth_PeerCredAuth_Integration(t *testing.T) {
 	}
 }
 
+// udsSystemAccountConfig builds a server config that maps the current uid to a
+// user in the system account over UDS.
+func udsSystemAccountConfig(sockPath string, uid int) string {
+	return fmt.Sprintf(`
+		port: -1
+		uds { path: %q }
+		system_account: "$SYS"
+		accounts {
+			$SYS {
+				users = [
+					{
+						user: "uds-admin"
+						uds { match { uid: %d } }
+						permissions {
+							publish { allow: [ ">" ] }
+							subscribe { allow: [ ">" ] }
+						}
+					}
+				]
+			}
+		}
+	`, sockPath, uid)
+}
+
+// TestUDS_Account_PlacesPeerInSystemAccount maps the current uid into $SYS over
+// UDS and verifies the peer lands there. With only $G+$SYS and no authorization
+// block, the server auto-creates a no_auth_user→$G (sysAccOnlyNoAuthUser); this
+// also guards that it does not shadow UDS peer-cred auth.
+func TestUDS_Account_PlacesPeerInSystemAccount(t *testing.T) {
+	uid := os.Getuid()
+	sockPath := udsTempSock(t)
+	conf := udsSystemAccountConfig(sockPath, uid)
+
+	s, _ := RunServerWithConfig(createConfFile(t, []byte(conf)))
+	defer s.Shutdown()
+
+	if err := s.readyForConnections(5 * time.Second); err != nil {
+		t.Fatalf("server not ready: %v", err)
+	}
+
+	conn, err := net.DialTimeout("unix", sockPath, 3*time.Second)
+	if err != nil {
+		t.Fatalf("dial uds: %v", err)
+	}
+	defer conn.Close()
+
+	reader := bufio.NewReader(conn)
+	if _, err := reader.ReadString('\n'); err != nil { // INFO
+		t.Fatalf("read INFO: %v", err)
+	}
+	if _, err := conn.Write([]byte("CONNECT {\"verbose\":false}\r\nPING\r\n")); err != nil {
+		t.Fatalf("write CONNECT/PING: %v", err)
+	}
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read PONG: %v", err)
+	}
+	if strings.HasPrefix(line, "-ERR") {
+		t.Fatalf("authentication failed: %s", strings.TrimSpace(line))
+	}
+	if !strings.HasPrefix(line, "PONG") {
+		t.Fatalf("expected PONG, got: %q", line)
+	}
+
+	// The authenticated UDS peer must have landed in $SYS, not $G.
+	if got := connClientAccount(t, s); got != DEFAULT_SYSTEM_ACCOUNT {
+		t.Fatalf("peer account = %q, want %q", got, DEFAULT_SYSTEM_ACCOUNT)
+	}
+}
+
+func TestUDS_Account_ReloadSupported(t *testing.T) {
+	uid := os.Getuid()
+	sockPath := udsTempSock(t)
+	conf := udsSystemAccountConfig(sockPath, uid)
+
+	s, _ := RunServerWithConfig(createConfFile(t, []byte(conf)))
+	defer s.Shutdown()
+
+	// Regression guard: a UDS rule carrying a live *Account must not make
+	// diffOptions reject the reload (see uds-account-reload-landmine).
+	if err := s.Reload(); err != nil {
+		t.Fatalf("reload with UDS-in-account config failed: %v", err)
+	}
+	if err := s.Reload(); err != nil {
+		t.Fatalf("second reload failed: %v", err)
+	}
+}
+
+// udsTempSock returns a socket path short enough to stay under the unix
+// sun_path limit (~107 bytes); t.TempDir() embeds the (long) test name and can
+// overflow it. The directory is removed when the test ends.
+func udsTempSock(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "uds")
+	if err != nil {
+		t.Fatalf("mkdir temp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	return filepath.Join(dir, "s.sock")
+}
+
+// connClientAccount returns the account name of the single external CLIENT
+// connection registered on the server, waiting briefly for it to appear.
+func connClientAccount(t *testing.T, s *Server) string {
+	t.Helper()
+	var got string
+	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		for _, c := range s.clients {
+			c.mu.Lock()
+			kind := c.kind
+			var accName string
+			if c.acc != nil {
+				accName = c.acc.Name
+			}
+			c.mu.Unlock()
+			if kind == CLIENT {
+				got = accName
+				return nil
+			}
+		}
+		return fmt.Errorf("no CLIENT connection registered yet")
+	})
+	return got
+}
+
+// TestUDS_ExplicitCredsReachDedicatedAccount proves that a client may bypass
+// peer-cred auth and authenticate normally (here: user/pass) over the UNIX
+// socket, landing in a dedicated account. This is the escape hatch for a
+// process that needs an account other than the one its peer creds map to.
+func TestUDS_ExplicitCredsReachDedicatedAccount(t *testing.T) {
+	sockPath := udsTempSock(t)
+	conf := fmt.Sprintf(`
+		port: -1
+		uds { path: %q }
+		accounts {
+			APP {
+				users = [ { user: "svc", password: "pw" } ]
+			}
+		}
+	`, sockPath)
+
+	s, _ := RunServerWithConfig(createConfFile(t, []byte(conf)))
+	defer s.Shutdown()
+
+	if err := s.readyForConnections(5 * time.Second); err != nil {
+		t.Fatalf("server not ready: %v", err)
+	}
+
+	conn, err := net.DialTimeout("unix", sockPath, 3*time.Second)
+	if err != nil {
+		t.Fatalf("dial uds: %v", err)
+	}
+	defer conn.Close()
+
+	reader := bufio.NewReader(conn)
+	if _, err := reader.ReadString('\n'); err != nil { // INFO
+		t.Fatalf("read INFO: %v", err)
+	}
+	// Explicit user/pass on CONNECT must skip peer-cred auth entirely.
+	if _, err := conn.Write([]byte("CONNECT {\"verbose\":false,\"user\":\"svc\",\"pass\":\"pw\"}\r\nPING\r\n")); err != nil {
+		t.Fatalf("write CONNECT/PING: %v", err)
+	}
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read PONG: %v", err)
+	}
+	if strings.HasPrefix(line, "-ERR") {
+		t.Fatalf("explicit-cred authentication failed: %s", strings.TrimSpace(line))
+	}
+	if !strings.HasPrefix(line, "PONG") {
+		t.Fatalf("expected PONG, got: %q", line)
+	}
+
+	if got := connClientAccount(t, s); got != "APP" {
+		t.Fatalf("peer account = %q, want APP", got)
+	}
+}
+
 func TestUDS_NewSocketSpec(t *testing.T) {
 	// Get root group for name lookup test (always exists)
 	rootGroup, err := user.LookupGroupId("0")

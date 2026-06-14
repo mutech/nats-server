@@ -343,6 +343,18 @@ func (a *authorizationOption) Apply(server *Server) {
 	server.Noticef("Reloaded: authorization token")
 }
 
+// udsRulesOption implements the option interface for UDS authorization rules.
+type udsRulesOption struct {
+	authOption
+}
+
+// Apply is a no-op because authorization will be reloaded after options are
+// applied; UDS auth reads s.getOpts().UDSRules live, so the swapped options are
+// what take effect for new connections.
+func (u *udsRulesOption) Apply(server *Server) {
+	server.Noticef("Reloaded: UDS authorization rules")
+}
+
 // authTimeoutOption implements the option interface for the authorization
 // `timeout` setting.
 type authTimeoutOption struct {
@@ -1626,8 +1638,10 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 
 		// accounts and users (referencing accounts) will always differ as accounts
 		// contain internal state, say locks etc..., so we don't bother here.
-		// This also avoids races with atomic stats counters
-		if optName != "accounts" && optName != "users" {
+		// This also avoids races with atomic stats counters. UDS rules likewise
+		// carry a live *Account pointer (account-scoped rules), so a deep compare
+		// would recurse into account internals — skip it for the same reason.
+		if optName != "accounts" && optName != "users" && optName != "udsrules" {
 			if changed := !reflect.DeepEqual(oldValue, newValue); !changed {
 				// Check to make sure we are running JetStream if we think we should be.
 				if optName == "jetstream" && newValue.(bool) {
@@ -1681,6 +1695,8 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 			diffOpts = append(diffOpts, &authTimeoutOption{newValue: newValue.(float64)})
 		case "users":
 			diffOpts = append(diffOpts, &usersOption{})
+		case "udsrules":
+			diffOpts = append(diffOpts, &udsRulesOption{})
 		case "nkeys":
 			diffOpts = append(diffOpts, &nkeysOption{})
 		case "cluster":

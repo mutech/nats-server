@@ -367,3 +367,114 @@ func TestUDS_Config_Parsing(t *testing.T) {
 		}
 	})
 }
+
+func TestUDS_Config_Account(t *testing.T) {
+	t.Run("uds rule in account binds account", func(t *testing.T) {
+		opts := mustParseUDSConfig(t, `
+			accounts {
+				APP {
+					users = [
+						{
+							user: "alice"
+							uds { match { uid: 1000 } }
+							permissions { publish { allow: [ ">" ] } }
+						}
+					]
+				}
+			}
+		`)
+		r := udsRuleByUsername(t, opts, "alice")
+		if r.Account == nil {
+			t.Fatal("Account = nil, want APP account")
+		}
+		if r.Account.Name != "APP" {
+			t.Errorf("Account.Name = %q, want APP", r.Account.Name)
+		}
+	})
+
+	t.Run("uds rule in $SYS account", func(t *testing.T) {
+		opts := mustParseUDSConfig(t, `
+			system_account: "$SYS"
+			accounts {
+				$SYS {
+					users = [
+						{
+							user: "uds-admin"
+							uds { match { uid: 0 } }
+							permissions {
+								publish { allow: [ ">" ] }
+								subscribe { allow: [ ">" ] }
+							}
+						}
+					]
+				}
+			}
+		`)
+		r := udsRuleByUsername(t, opts, "uds-admin")
+		if r.Account == nil || r.Account.Name != "$SYS" {
+			t.Fatalf("Account = %#v, want $SYS", r.Account)
+		}
+	})
+
+	t.Run("authorization-block rule stays accountless", func(t *testing.T) {
+		opts := mustParseUDSConfig(t, `
+			authorization {
+				users = [
+					{
+						user: "alice"
+						uds { match { uid: 1000 } }
+						permissions { publish { allow: [ ">" ] } }
+					}
+				]
+			}
+		`)
+		r := udsRuleByUsername(t, opts, "alice")
+		if r.Account != nil {
+			t.Fatalf("Account = %#v, want nil for authorization{} rule", r.Account)
+		}
+	})
+
+	t.Run("error duplicate username across account and authorization", func(t *testing.T) {
+		_, err := parseUDSConfigString(t, `
+			authorization {
+				users = [
+					{ user: "dup", uds { match { uid: 1000 } }, permissions { publish { allow: [ ">" ] } } }
+				]
+			}
+			accounts {
+				APP {
+					users = [
+						{ user: "dup", uds { match { uid: 2000 } }, permissions { publish { allow: [ ">" ] } } }
+					]
+				}
+			}
+		`)
+		if err == nil || !strings.Contains(err.Error(), "Duplicate user") {
+			t.Fatalf("want duplicate user error, got: %v", err)
+		}
+	})
+
+	t.Run("role-only rule in account is bound to account", func(t *testing.T) {
+		opts := mustParseUDSConfig(t, `
+			accounts {
+				APP {
+					users = [
+						{ uds { role: "r", match { uid: 1000 } }, permissions { publish { allow: [ ">" ] } } }
+					]
+				}
+			}
+		`)
+		var role *UDSRule
+		for _, r := range opts.UDSRules {
+			if r.Rolename == "r" {
+				role = r
+			}
+		}
+		if role == nil {
+			t.Fatalf("no UDS rule with role %q (have %d rules)", "r", len(opts.UDSRules))
+		}
+		if role.Account == nil || role.Account.Name != "APP" {
+			t.Fatalf("role rule Account = %#v, want APP", role.Account)
+		}
+	})
+}

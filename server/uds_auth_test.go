@@ -14,6 +14,7 @@
 package server
 
 import (
+	"slices"
 	"testing"
 )
 
@@ -244,6 +245,96 @@ func TestUDS_Auth_EmptyPermissions(t *testing.T) {
 	}
 	if len(result.warnings) == 0 {
 		t.Error("expected warning")
+	}
+}
+
+func TestUDS_Auth_AccountPropagated(t *testing.T) {
+	acc := NewAccount("APP")
+	rules := []*UDSRule{
+		{
+			Username:    "alice",
+			Match:       matchPattern(map[string]any{"uid": 1000}),
+			Permissions: &Permissions{Publish: &SubjectPermission{Allow: []string{">"}}},
+			Account:     acc,
+		},
+	}
+	result, err := udsAuthenticatePeer(rules, testQueries, UDSPeerCreds{UID: 1000})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.authenticated {
+		t.Fatal("expected authenticated")
+	}
+	if result.account != acc {
+		t.Fatalf("result.account = %v, want %q account", result.account, acc.Name)
+	}
+}
+
+func TestUDS_Auth_AccountNilWhenUnset(t *testing.T) {
+	rules := []*UDSRule{
+		{
+			Username:    "alice",
+			Match:       matchPattern(map[string]any{"uid": 1000}),
+			Permissions: &Permissions{Publish: &SubjectPermission{Allow: []string{">"}}},
+		},
+	}
+	result, err := udsAuthenticatePeer(rules, testQueries, UDSPeerCreds{UID: 1000})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.authenticated {
+		t.Fatal("expected authenticated")
+	}
+	if result.account != nil {
+		t.Fatalf("result.account = %v, want nil (no account bound)", result.account)
+	}
+}
+
+func TestUDS_Auth_RoleScopedToAccount(t *testing.T) {
+	accA := NewAccount("A")
+	accB := NewAccount("B")
+	rules := []*UDSRule{
+		// Authenticating user rule in account A.
+		{
+			Username:    "alice",
+			Account:     accA,
+			Match:       matchPattern(map[string]any{"uid": 1000}),
+			Permissions: &Permissions{Publish: &SubjectPermission{Allow: []string{"a.>"}}},
+		},
+		// Role in a different account: must be ignored (cross-account).
+		{
+			Rolename:    "fromB",
+			Account:     accB,
+			Match:       matchPattern(map[string]any{"uid": 1000}),
+			Permissions: &Permissions{Publish: &SubjectPermission{Allow: []string{"b.>"}}},
+		},
+		// Role in the same account: must contribute.
+		{
+			Rolename:    "fromA",
+			Account:     accA,
+			Match:       matchPattern(map[string]any{"uid": 1000}),
+			Permissions: &Permissions{Publish: &SubjectPermission{Allow: []string{"a-extra.>"}}},
+		},
+	}
+	result, err := udsAuthenticatePeer(rules, testQueries, UDSPeerCreds{UID: 1000})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.authenticated {
+		t.Fatal("expected authenticated")
+	}
+	if result.account != accA {
+		t.Fatalf("result.account = %v, want account A", result.account)
+	}
+	if len(result.roles) != 1 || result.roles[0] != "fromA" {
+		t.Fatalf("roles = %v, want only in-scope [fromA]", result.roles)
+	}
+	allow := result.permissions.Publish.Allow
+	if !slices.Contains(allow, "a.>") || !slices.Contains(allow, "a-extra.>") {
+		t.Fatalf("publish allow = %v, want a.> and a-extra.>", allow)
+	}
+	if slices.Contains(allow, "b.>") {
+		t.Fatalf("publish allow = %v, must not leak cross-account b.>", allow)
 	}
 }
 

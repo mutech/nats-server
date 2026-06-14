@@ -3792,11 +3792,23 @@ func parseAccounts(v any, opts *Options, errors *[]error, warnings *[]error) err
 				}
 			}
 
-			// Report error if UDS rules are used in accounts
-			if len(udsRules) > 0 {
-				err := &configErr{usersTk, "Can not have UDS rules in accounts"}
-				*errors = append(*errors, err)
-				continue
+			// Bind UDS rules to this account. A UDS rule carries its own
+			// peer-cred match and permissions; the enclosing accounts{} block
+			// sets the account scope. The account is both the placement target
+			// for an authenticating (user) rule and the scope within which a
+			// role's permissions apply — a role defined here is ignored for
+			// peers in any other scope (see authenticatePeer).
+			for _, rule := range udsRules {
+				if rule.Username != _EMPTY_ {
+					if _, ok := uorn[rule.Username]; ok {
+						err := &configErr{usersTk, fmt.Sprintf("Duplicate user %q detected", rule.Username)}
+						*errors = append(*errors, err)
+						continue
+					}
+					uorn[rule.Username] = struct{}{}
+				}
+				rule.Account = acc
+				opts.UDSRules = append(opts.UDSRules, rule)
 			}
 
 			// Report error if there is an authorization{} block

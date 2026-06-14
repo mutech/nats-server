@@ -246,49 +246,82 @@ func (ctx *udsAuthContext) authenticatePeer() (udsPeerAuthResult, error) {
 	result := udsPeerAuthResult{}
 	peerCredsStr := fmt.Sprintf("uid=%d,gid=%d,pid=%d", ctx.peerCreds.UID, ctx.peerCreds.GID, ctx.peerCreds.PID)
 
+	// Collect every rule whose match predicate matches the peer. Matching is
+	// independent of account scope; scope only governs which of these matched
+	// rules contribute to the authenticated peer below.
+	var matched []*UDSRule
+	for _, rule := range ctx.rules {
+		if rule.Match == nil {
+			continue
+		}
+		ok, err := rule.Match.matches(ctx)
+		if err != nil {
+			return result, fmt.Errorf("rule %q: %w", rule.Username, err)
+		}
+		if ok {
+			matched = append(matched, rule)
+		}
+	}
+
+	// Determine THE one authenticating rule. A rule authenticates if it carries
+	// a username (pure user rule, or mixed user/role rule). Pure user rules have
+	// priority over mixed rules and must be unique. Mixed rules authenticate only
+	// as a fallback when no pure user rule matches, and then must themselves be
+	// unique; once a pure user rule authenticates, any number of mixed rules may
+	// also match (they then only contribute roles/permissions, in scope). The
+	// outcome is independent of rule order.
+	var pureUsers, mixedUsers []*UDSRule
+	for _, rule := range matched {
+		switch {
+		case rule.Username == _EMPTY_:
+			// role-only rule: never authenticates
+		case rule.Rolename == _EMPTY_:
+			pureUsers = append(pureUsers, rule)
+		default:
+			mixedUsers = append(mixedUsers, rule)
+		}
+	}
+
+	var authenticatingRule *UDSRule
+	switch {
+	case len(pureUsers) > 1:
+		result.warnings = append(result.warnings,
+			fmt.Sprintf("%s: multiple user rules match: %q and %q", peerCredsStr, pureUsers[0].Username, pureUsers[1].Username))
+		return result, nil
+	case len(pureUsers) == 1:
+		authenticatingRule = pureUsers[0]
+	case len(mixedUsers) > 1:
+		result.warnings = append(result.warnings,
+			fmt.Sprintf("%s: multiple mixed user/role rules match: %q and %q", peerCredsStr, mixedUsers[0].Username, mixedUsers[1].Username))
+		return result, nil
+	case len(mixedUsers) == 1:
+		authenticatingRule = mixedUsers[0]
+	default:
+		// No rule with a username matches: the peer cannot connect.
+		return result, nil
+	}
+	result.authenticated = true
+	result.authenticatingRule = authenticatingRule.Username
+
+	// The account of the authenticating rule is the peer's scope. A nil account
+	// (rules from authorization{}) is its own distinct scope, not a synonym for
+	// $G. Roles and permissions apply only within their scope: a rule defined in
+	// one account is ignored for peers in every other scope, including no-account.
+	scope := authenticatingRule.Account
+	result.account = scope
+
 	var pubAllow, pubDeny, subAllow, subDeny []string
 	var respMaxMsgs int
 	var respExpires time.Duration
 	hasPermissions := false
 
-	var authenticatingRule *UDSRule // track THE one authenticating rule
-
-	for _, rule := range ctx.rules {
-		if rule.Match == nil {
+	for _, rule := range matched {
+		if rule.Account != scope {
 			continue
 		}
-		matched, err := rule.Match.matches(ctx)
-		if err != nil {
-			return result, fmt.Errorf("rule %q: %w", rule.Username, err)
-		}
-		if !matched {
-			continue
-		}
-
-		// Check if this rule grants authentication and does not conflict with other authenticating rules
-		if rule.Username != _EMPTY_ {
-			if authenticatingRule == nil || (authenticatingRule.Rolename != _EMPTY_ && rule.Rolename == _EMPTY_) {
-				authenticatingRule = rule
-				result.authenticated = true
-				result.authenticatingRule = rule.Username
-			} else if authenticatingRule.Rolename != _EMPTY_ {
-				result.warnings = append(result.warnings,
-					fmt.Sprintf("%s: multiple mixed user/role rules match: %q and %q", peerCredsStr, authenticatingRule.Username, rule.Username))
-				result.authenticated = false
-				return result, nil
-			} else if rule.Rolename == _EMPTY_ {
-				result.warnings = append(result.warnings,
-					fmt.Sprintf("%s: multiple user rules match: %q and %q", peerCredsStr, authenticatingRule.Username, rule.Username))
-				result.authenticated = false
-				return result, nil
-			}
-		}
-
 		if rule.Rolename != _EMPTY_ {
 			result.roles = append(result.roles, rule.Rolename)
 		}
-
-		// Merge permissions
 		if rule.Permissions != nil {
 			hasPermissions = true
 			if rule.Permissions.Publish != nil {
@@ -310,9 +343,6 @@ func (ctx *udsAuthContext) authenticatePeer() (udsPeerAuthResult, error) {
 		}
 	}
 
-	if !result.authenticated || authenticatingRule == nil {
-		return result, nil
-	}
 	if !hasPermissions {
 		result.authenticated = false
 		result.warnings = append(result.warnings, fmt.Sprintf("%q: no permissions defined", peerCredsStr))
