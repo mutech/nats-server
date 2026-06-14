@@ -454,6 +454,26 @@ func TestUDS_Config_Account(t *testing.T) {
 		}
 	})
 
+	t.Run("error duplicate username across two accounts", func(t *testing.T) {
+		_, err := parseUDSConfigString(t, `
+			accounts {
+				APP {
+					users = [
+						{ user: "dup", uds { match { uid: 1000 } }, permissions { publish { allow: [ ">" ] } } }
+					]
+				}
+				OTHER {
+					users = [
+						{ user: "dup", uds { match { uid: 2000 } }, permissions { publish { allow: [ ">" ] } } }
+					]
+				}
+			}
+		`)
+		if err == nil || !strings.Contains(err.Error(), "Duplicate user") {
+			t.Fatalf("want duplicate user error across accounts, got: %v", err)
+		}
+	})
+
 	t.Run("role-only rule in account is bound to account", func(t *testing.T) {
 		opts := mustParseUDSConfig(t, `
 			accounts {

@@ -1639,8 +1639,8 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 		// accounts and users (referencing accounts) will always differ as accounts
 		// contain internal state, say locks etc..., so we don't bother here.
 		// This also avoids races with atomic stats counters. UDS rules likewise
-		// carry a live *Account pointer (account-scoped rules), so a deep compare
-		// would recurse into account internals — skip it for the same reason.
+		// reference an *Account (account-scoped rules), so a deep compare would
+		// recurse into account internals — skip it for the same reason.
 		if optName != "accounts" && optName != "users" && optName != "udsrules" {
 			if changed := !reflect.DeepEqual(oldValue, newValue); !changed {
 				// Check to make sure we are running JetStream if we think we should be.
