@@ -1,0 +1,369 @@
+// Copyright 2026 Michael Utech
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//go:build linux
+
+package server
+
+import (
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"testing"
+)
+
+func parseUDSConfigString(t *testing.T, conf string) (*Options, error) {
+	t.Helper()
+	f := filepath.Join(t.TempDir(), "uds.conf")
+	if err := os.WriteFile(f, []byte(conf), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	return ProcessConfigFile(f)
+}
+
+func mustParseUDSConfig(t *testing.T, conf string) *Options {
+	t.Helper()
+	opts, err := parseUDSConfigString(t, conf)
+	if err != nil {
+		t.Fatalf("unexpected config error: %v\nconfig:\n%s", err, conf)
+	}
+	return opts
+}
+
+func udsRuleByUsername(t *testing.T, opts *Options, name string) *UDSRule {
+	t.Helper()
+	for _, r := range opts.UDSRules {
+		if r.Username == name {
+			return r
+		}
+	}
+	t.Fatalf("no UDS rule with username %q (have %d rules)", name, len(opts.UDSRules))
+	return nil
+}
+
+func assertExpr(t *testing.T, alt map[UDSRuleExpression]any, query string, negate bool, want any) {
+	t.Helper()
+	got, ok := alt[UDSRuleExpression{QueryName: query, Negate: negate}]
+	if !ok {
+		t.Fatalf("expression %q (negate=%v) not found in alternative %#v", query, negate, alt)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("expression %q value = %#v (%T), want %#v (%T)", query, got, got, want, want)
+	}
+}
+
+func TestUDS_Config_Parsing(t *testing.T) {
+	t.Run("connection block full", func(t *testing.T) {
+		opts := mustParseUDSConfig(t, `
+			uds {
+				path: "/tmp/full.sock"
+				group: "nats"
+				mode: "0660"
+			}
+		`)
+		if opts.UDS.Path != "/tmp/full.sock" {
+			t.Errorf("Path = %q, want /tmp/full.sock", opts.UDS.Path)
+		}
+		if opts.UDS.Group != "nats" {
+			t.Errorf("Group = %q, want nats", opts.UDS.Group)
+		}
+		if opts.UDS.Mode != "0660" {
+			t.Errorf("Mode = %q, want 0660", opts.UDS.Mode)
+		}
+	})
+
+	t.Run("connection block path only", func(t *testing.T) {
+		opts := mustParseUDSConfig(t, `uds { path: "/tmp/only.sock" }`)
+		if opts.UDS.Path != "/tmp/only.sock" {
+			t.Errorf("Path = %q, want /tmp/only.sock", opts.UDS.Path)
+		}
+		if opts.UDS.Group != "" || opts.UDS.Mode != "" {
+			t.Errorf("expected empty group/mode, got group=%q mode=%q", opts.UDS.Group, opts.UDS.Mode)
+		}
+	})
+
+	t.Run("user rule single match", func(t *testing.T) {
+		opts := mustParseUDSConfig(t, `
+			authorization {
+				users = [
+					{
+						user: "alice"
+						uds { match { uid: 1000 } }
+					}
+				]
+			}
+		`)
+		if len(opts.UDSRules) != 1 {
+			t.Fatalf("want 1 UDS rule, got %d", len(opts.UDSRules))
+		}
+		for _, u := range opts.Users {
+			if u.Username == "alice" {
+				t.Fatalf("UDS rule user %q leaked into opts.Users", u.Username)
+			}
+		}
+		r := udsRuleByUsername(t, opts, "alice")
+		if r.Rolename != "" {
+			t.Errorf("Rolename = %q, want empty", r.Rolename)
+		}
+		if r.Match == nil || len(*r.Match) != 1 {
+			t.Fatalf("Match = %#v, want one alternative", r.Match)
+		}
+		assertExpr(t, (*r.Match)[0], "uid", false, int64(1000))
+	})
+
+	t.Run("role only rule", func(t *testing.T) {
+		opts := mustParseUDSConfig(t, `
+			authorization {
+				users = [
+					{
+						uds {
+							role: "admin"
+							match { gid: 0 }
+						}
+					}
+				]
+			}
+		`)
+		if len(opts.UDSRules) != 1 {
+			t.Fatalf("want 1 UDS rule, got %d", len(opts.UDSRules))
+		}
+		r := opts.UDSRules[0]
+		if r.Username != "" {
+			t.Errorf("Username = %q, want empty", r.Username)
+		}
+		if r.Rolename != "admin" {
+			t.Errorf("Rolename = %q, want admin", r.Rolename)
+		}
+		if r.Match == nil || len(*r.Match) != 1 {
+			t.Fatalf("Match = %#v, want one alternative", r.Match)
+		}
+		assertExpr(t, (*r.Match)[0], "gid", false, int64(0))
+	})
+
+	t.Run("mixed user and role rule", func(t *testing.T) {
+		opts := mustParseUDSConfig(t, `
+			authorization {
+				users = [
+					{
+						user: "bob"
+						uds {
+							role: "ops"
+							match { uid: 1000 }
+						}
+					}
+				]
+			}
+		`)
+		r := udsRuleByUsername(t, opts, "bob")
+		if r.Rolename != "ops" {
+			t.Errorf("Rolename = %q, want ops", r.Rolename)
+		}
+		assertExpr(t, (*r.Match)[0], "uid", false, int64(1000))
+	})
+
+	t.Run("match multiple AND conditions", func(t *testing.T) {
+		opts := mustParseUDSConfig(t, `
+			authorization {
+				users = [
+					{
+						user: "carol"
+						uds {
+							match {
+								uid: 1000
+								gid: 1000
+							}
+						}
+					}
+				]
+			}
+		`)
+		r := udsRuleByUsername(t, opts, "carol")
+		if r.Match == nil || len(*r.Match) != 1 {
+			t.Fatalf("Match = %#v, want one alternative", r.Match)
+		}
+		alt := (*r.Match)[0]
+		if len(alt) != 2 {
+			t.Fatalf("want 2 AND expressions, got %d: %#v", len(alt), alt)
+		}
+		assertExpr(t, alt, "uid", false, int64(1000))
+		assertExpr(t, alt, "gid", false, int64(1000))
+	})
+
+	t.Run("match OR alternatives", func(t *testing.T) {
+		opts := mustParseUDSConfig(t, `
+			authorization {
+				users = [
+					{
+						user: "dave"
+						uds {
+							match: [
+								{uid: 1000}
+								{gid: 0}
+							]
+						}
+					}
+				]
+			}
+		`)
+		r := udsRuleByUsername(t, opts, "dave")
+		if r.Match == nil || len(*r.Match) != 2 {
+			t.Fatalf("Match = %#v, want two alternatives", r.Match)
+		}
+		assertExpr(t, (*r.Match)[0], "uid", false, int64(1000))
+		assertExpr(t, (*r.Match)[1], "gid", false, int64(0))
+	})
+
+	t.Run("match negation", func(t *testing.T) {
+		opts := mustParseUDSConfig(t, `
+			authorization {
+				users = [
+					{
+						user: "erin"
+						uds { match { "!uid": 0 } }
+					}
+				]
+			}
+		`)
+		r := udsRuleByUsername(t, opts, "erin")
+		assertExpr(t, (*r.Match)[0], "uid", true, int64(0))
+	})
+
+	t.Run("match string query", func(t *testing.T) {
+		opts := mustParseUDSConfig(t, `
+			authorization {
+				users = [
+					{
+						user: "frank"
+						uds { match { "uid.name": "frank" } }
+					}
+				]
+			}
+		`)
+		r := udsRuleByUsername(t, opts, "frank")
+		assertExpr(t, (*r.Match)[0], "uid.name", false, "frank")
+	})
+
+	t.Run("match array value", func(t *testing.T) {
+		opts := mustParseUDSConfig(t, `
+			authorization {
+				users = [
+					{
+						user: "grace"
+						uds { match { groups: [ 10, 20 ] } }
+					}
+				]
+			}
+		`)
+		r := udsRuleByUsername(t, opts, "grace")
+		assertExpr(t, (*r.Match)[0], "groups", false, []any{int64(10), int64(20)})
+	})
+
+	t.Run("rule permissions", func(t *testing.T) {
+		opts := mustParseUDSConfig(t, `
+			authorization {
+				users = [
+					{
+						user: "heidi"
+						uds { match { uid: 1000 } }
+						permissions {
+							publish {
+								allow: [ "pub.allow.>" ]
+								deny: [ "pub.deny.>" ]
+							}
+							subscribe {
+								allow: [ "sub.allow.>" ]
+								deny: [ "sub.deny.>" ]
+							}
+						}
+					}
+				]
+			}
+		`)
+		r := udsRuleByUsername(t, opts, "heidi")
+		if r.Permissions == nil {
+			t.Fatal("Permissions = nil, want populated")
+		}
+		if r.Permissions.Publish == nil || !reflect.DeepEqual(r.Permissions.Publish.Allow, []string{"pub.allow.>"}) {
+			t.Errorf("Publish.Allow = %#v, want [pub.allow.>]", r.Permissions.Publish)
+		}
+		if !reflect.DeepEqual(r.Permissions.Publish.Deny, []string{"pub.deny.>"}) {
+			t.Errorf("Publish.Deny = %#v, want [pub.deny.>]", r.Permissions.Publish.Deny)
+		}
+		if r.Permissions.Subscribe == nil || !reflect.DeepEqual(r.Permissions.Subscribe.Allow, []string{"sub.allow.>"}) {
+			t.Errorf("Subscribe.Allow = %#v, want [sub.allow.>]", r.Permissions.Subscribe)
+		}
+		if !reflect.DeepEqual(r.Permissions.Subscribe.Deny, []string{"sub.deny.>"}) {
+			t.Errorf("Subscribe.Deny = %#v, want [sub.deny.>]", r.Permissions.Subscribe.Deny)
+		}
+	})
+
+	t.Run("combined connection block and rules", func(t *testing.T) {
+		opts := mustParseUDSConfig(t, `
+			uds {
+				path: "/tmp/combined.sock"
+				mode: "0660"
+			}
+			authorization {
+				users = [
+					{
+						user: "ivan"
+						uds { match { uid: 1000 } }
+						permissions { publish { allow: [ ">" ] } }
+					}
+				]
+			}
+		`)
+		if opts.UDS.Path != "/tmp/combined.sock" {
+			t.Errorf("Path = %q, want /tmp/combined.sock", opts.UDS.Path)
+		}
+		r := udsRuleByUsername(t, opts, "ivan")
+		assertExpr(t, (*r.Match)[0], "uid", false, int64(1000))
+		if r.Permissions == nil || r.Permissions.Publish == nil {
+			t.Fatalf("expected publish permissions, got %#v", r.Permissions)
+		}
+	})
+
+	t.Run("error missing match clause", func(t *testing.T) {
+		_, err := parseUDSConfigString(t, `
+			authorization {
+				users = [ { user: "x", uds { role: "r" } } ]
+			}
+		`)
+		if err == nil || !strings.Contains(err.Error(), "match clause") {
+			t.Fatalf("want error about missing match clause, got: %v", err)
+		}
+	})
+
+	t.Run("error no user or role", func(t *testing.T) {
+		_, err := parseUDSConfigString(t, `
+			authorization {
+				users = [ { uds { match { uid: 0 } } } ]
+			}
+		`)
+		if err == nil || !strings.Contains(err.Error(), "user and/or role") {
+			t.Fatalf("want error about requiring user and/or role, got: %v", err)
+		}
+	})
+
+	t.Run("error uds rule with password", func(t *testing.T) {
+		_, err := parseUDSConfigString(t, `
+			authorization {
+				users = [ { user: "x", password: "y", uds { match { uid: 0 } } } ]
+			}
+		`)
+		if err == nil || !strings.Contains(err.Error(), "passwords") {
+			t.Fatalf("want error about passwords, got: %v", err)
+		}
+	})
+}

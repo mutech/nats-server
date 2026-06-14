@@ -4680,7 +4680,7 @@ func parseUsers(mv any, errors *[]error) ([]*NkeyUser, []*User, []*UDSRule, erro
 				nkey.ProxyRequired = v.(bool)
 				user.ProxyRequired = v.(bool)
 			case "uds":
-				rule.Rolename, rule.Match, err = parseUDSUserRuleParts(mv, errors)
+				rule.Rolename, rule.Match, err = parseUDSUserRuleParts(v, errors)
 				if err != nil {
 					*errors = append(*errors, err)
 					continue
@@ -4710,10 +4710,10 @@ func parseUsers(mv any, errors *[]error) ([]*NkeyUser, []*User, []*UDSRule, erro
 			}
 		}
 
-		// Check to make sure we have at least an nkey or username <password> defined.
-		if nkey.Nkey == _EMPTY_ && user.Username == _EMPTY_ && rule.Rolename == _EMPTY_ {
-			return nil, nil, nil, &configErr{tk, "User entry requires a user"}
-		} else if nkey.Nkey != _EMPTY_ {
+		// Classify the entry as an nkey user, a UDS rule, or a user/pass user.
+		// UDS rules are checked before the generic "requires a user" guard so a
+		// UDS entry missing both user and role reports the UDS-specific error.
+		if nkey.Nkey != _EMPTY_ {
 			// Make sure the nkey a proper public nkey for a user..
 			if !nkeys.IsValidPublicUserKey(nkey.Nkey) {
 				return nil, nil, nil, &configErr{tk, "Not a valid public nkey for a user"}
@@ -4739,6 +4739,8 @@ func parseUsers(mv any, errors *[]error) ([]*NkeyUser, []*User, []*UDSRule, erro
 				return nil, nil, nil, &configErr{tk, "UDS rules do not take passwords"}
 			}
 			udsRules = append(udsRules, rule)
+		} else if user.Username == _EMPTY_ {
+			return nil, nil, nil, &configErr{tk, "User entry requires a user"}
 		} else {
 			users = append(users, user)
 		}
