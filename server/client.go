@@ -154,6 +154,7 @@ const (
 	compressionNegotiated                         // Marks if this connection has negotiated compression level with remote.
 	didTLSFirst                                   // Marks if this connection requested and was accepted doing the TLS handshake first (prior to INFO).
 	isSlowConsumer                                // Marks connection as a slow consumer.
+	udsPeerCredAuthed                             // Authenticated from UNIX socket peer credentials (not a configured user).
 )
 
 // set the flag (would be equivalent to set the boolean to true)

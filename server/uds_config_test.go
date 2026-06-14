@@ -254,19 +254,32 @@ func TestUDS_Config_Parsing(t *testing.T) {
 		assertExpr(t, (*r.Match)[0], "uid.name", false, "frank")
 	})
 
-	t.Run("match array value", func(t *testing.T) {
-		opts := mustParseUDSConfig(t, `
+	t.Run("error array value for scalar query", func(t *testing.T) {
+		// Array match values are not implemented; a scalar query must reject one
+		// at config time rather than fail per-connection at match time.
+		_, err := parseUDSConfigString(t, `
 			authorization {
 				users = [
-					{
-						user: "grace"
-						uds { match { groups: [ 10, 20 ] } }
-					}
+					{ user: "grace", uds { match { groups: [ 10, 20 ] } } }
 				]
 			}
 		`)
-		r := udsRuleByUsername(t, opts, "grace")
-		assertExpr(t, (*r.Match)[0], "groups", false, []any{int64(10), int64(20)})
+		if err == nil || !strings.Contains(err.Error(), "groups") {
+			t.Fatalf("want error rejecting array value for %q, got: %v", "groups", err)
+		}
+	})
+
+	t.Run("error wrong scalar type for query", func(t *testing.T) {
+		_, err := parseUDSConfigString(t, `
+			authorization {
+				users = [
+					{ user: "heidi", uds { match { uid: "not-an-int" } } }
+				]
+			}
+		`)
+		if err == nil || !strings.Contains(err.Error(), "uid") {
+			t.Fatalf("want error rejecting string value for %q, got: %v", "uid", err)
+		}
 	})
 
 	t.Run("rule permissions", func(t *testing.T) {

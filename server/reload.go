@@ -2262,6 +2262,14 @@ func (s *Server) reloadAuthorization() {
 	// Gather clients that changed accounts. We will close them and they
 	// will reconnect, doing the right thing.
 	for _, client := range s.clients {
+		// UDS peer-cred connections are authenticated from kernel peer
+		// credentials, not a configured user, so the user-based reload machinery
+		// (user lookup, account swap) does not model them and would spuriously
+		// disconnect them. Leave them untouched; new connections pick up the new
+		// rules.
+		if client.isUDSPeerCredAuthed() {
+			continue
+		}
 		if s.clientHasMovedToDifferentAccount(client) {
 			cclients = append(cclients, client)
 		} else {

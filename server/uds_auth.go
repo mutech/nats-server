@@ -161,6 +161,7 @@ func parseUDSRulePatternAlternative(mv map[string]any, errors *[]error) (map[UDS
 		}
 
 		// validate value type
+		exprTk := tk
 		switch val := v.(type) {
 		case int64, string, bool:
 			result[query] = val
@@ -179,6 +180,18 @@ func parseUDSRulePatternAlternative(mv map[string]any, errors *[]error) (map[UDS
 			result[query] = unwrapped
 		default:
 			*errors = append(*errors, &configErr{tk, fmt.Sprintf("match condition %q: expected scalar (int/string/bool) or scalar array, got %T", k, v)})
+		}
+
+		// Validate the recorded value against the query's builtin validator for
+		// early, config-time feedback (e.g. "groups" takes a single int, not a
+		// string or an array — array matching is not implemented). Custom queries
+		// are not in this map; their own predicate validates at match time.
+		if stored, ok := result[query]; ok {
+			if bq, ok := builtinPeerCredQueries[query.QueryName]; ok && bq.validate != nil {
+				if err := bq.validate(stored); err != nil {
+					*errors = append(*errors, &configErr{exprTk, fmt.Sprintf("match query %q: %v", query.QueryName, err)})
+				}
+			}
 		}
 	}
 
@@ -201,6 +214,15 @@ type UDSPeerCreds struct {
 func (c *client) isUDSPeer() bool {
 	_, ok := c.nc.(*net.UnixConn)
 	return ok
+}
+
+// isUDSPeerCredAuthed reports whether the connection was authenticated from UNIX
+// socket peer credentials (rather than a configured user). Such connections are
+// not user-based, so the config-reload authorization machinery skips them.
+func (c *client) isUDSPeerCredAuthed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.flags.isSet(udsPeerCredAuthed)
 }
 
 func (s *Server) hasUDSPeerCredentialSupport() bool {

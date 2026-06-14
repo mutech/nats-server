@@ -475,6 +475,56 @@ func TestUDS_Account_PlacesPeerInSystemAccount(t *testing.T) {
 	}
 }
 
+// TestUDS_Account_ReloadKeepsConnection guards the regression where config
+// reload disconnected live UDS peer-cred connections: the reload authorization
+// machinery is user-based and classified a UDS peer (whose stored username is
+// the synthesized identity, not a configured user) as "account moved", closing
+// it. UDS peer-cred connections must survive reload.
+func TestUDS_Account_ReloadKeepsConnection(t *testing.T) {
+	uid := os.Getuid()
+	sockPath := udsTempSock(t)
+	s, _ := RunServerWithConfig(createConfFile(t, []byte(udsSystemAccountConfig(sockPath, uid))))
+	defer s.Shutdown()
+	if err := s.readyForConnections(5 * time.Second); err != nil {
+		t.Fatalf("server not ready: %v", err)
+	}
+
+	conn, err := net.DialTimeout("unix", sockPath, 3*time.Second)
+	if err != nil {
+		t.Fatalf("dial uds: %v", err)
+	}
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+	if _, err := reader.ReadString('\n'); err != nil { // INFO
+		t.Fatalf("read INFO: %v", err)
+	}
+	if _, err := conn.Write([]byte("CONNECT {\"verbose\":false}\r\nPING\r\n")); err != nil {
+		t.Fatalf("write CONNECT/PING: %v", err)
+	}
+	if line, err := reader.ReadString('\n'); err != nil || !strings.HasPrefix(line, "PONG") {
+		t.Fatalf("pre-reload PONG: line=%q err=%v", line, err)
+	}
+	if got := connClientAccount(t, s); got != DEFAULT_SYSTEM_ACCOUNT {
+		t.Fatalf("pre-reload account = %q, want %q", got, DEFAULT_SYSTEM_ACCOUNT)
+	}
+
+	if err := s.Reload(); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+
+	// The connection must still be alive and usable after reload.
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := conn.Write([]byte("PING\r\n")); err != nil {
+		t.Fatalf("post-reload write (connection dropped?): %v", err)
+	}
+	if line, err := reader.ReadString('\n'); err != nil || !strings.HasPrefix(line, "PONG") {
+		t.Fatalf("post-reload PONG (connection dropped?): line=%q err=%v", line, err)
+	}
+	if got := connClientAccount(t, s); got != DEFAULT_SYSTEM_ACCOUNT {
+		t.Fatalf("post-reload account = %q, want %q", got, DEFAULT_SYSTEM_ACCOUNT)
+	}
+}
+
 func TestUDS_Account_ReloadSupported(t *testing.T) {
 	uid := os.Getuid()
 	sockPath := udsTempSock(t)
@@ -582,6 +632,51 @@ func TestUDS_ExplicitCredsReachDedicatedAccount(t *testing.T) {
 
 	if got := connClientAccount(t, s); got != "APP" {
 		t.Fatalf("peer account = %q, want APP", got)
+	}
+}
+
+// TestUDS_NoAuthUserNotAppliedToPeer verifies an explicit no_auth_user does not
+// shadow UDS peer-cred auth: a no-credential UDS peer must authenticate via its
+// UDS rule (account APP), not be assigned the no_auth_user identity (account
+// ANON).
+func TestUDS_NoAuthUserNotAppliedToPeer(t *testing.T) {
+	uid := os.Getuid()
+	sockPath := udsTempSock(t)
+	conf := fmt.Sprintf(`
+		port: -1
+		uds { path: %q }
+		accounts {
+			ANON { users = [ { user: "anon", password: "x" } ] }
+			APP  { users = [ { user: "uds-app"
+			                   uds { match { uid: %d } }
+			                   permissions { publish { allow: [ ">" ] }, subscribe { allow: [ ">" ] } } } ] }
+		}
+		no_auth_user: "anon"
+	`, sockPath, uid)
+
+	s, _ := RunServerWithConfig(createConfFile(t, []byte(conf)))
+	defer s.Shutdown()
+	if err := s.readyForConnections(5 * time.Second); err != nil {
+		t.Fatalf("server not ready: %v", err)
+	}
+
+	conn, err := net.DialTimeout("unix", sockPath, 3*time.Second)
+	if err != nil {
+		t.Fatalf("dial uds: %v", err)
+	}
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+	if _, err := reader.ReadString('\n'); err != nil { // INFO
+		t.Fatalf("read INFO: %v", err)
+	}
+	if _, err := conn.Write([]byte("CONNECT {\"verbose\":false}\r\nPING\r\n")); err != nil {
+		t.Fatalf("write CONNECT/PING: %v", err)
+	}
+	if line, err := reader.ReadString('\n'); err != nil || !strings.HasPrefix(line, "PONG") {
+		t.Fatalf("PONG: line=%q err=%v", line, err)
+	}
+	if got := connClientAccount(t, s); got != "APP" {
+		t.Fatalf("peer account = %q, want APP (no_auth_user must not apply to UDS)", got)
 	}
 }
 

@@ -1247,6 +1247,7 @@ func (s *Server) processClientOrLeafAuthentication(c *client, opts *Options) (au
 			}
 		}
 		c.mu.Lock()
+		c.flags.set(udsPeerCredAuthed)
 		c.setPermissions(authResult.permissions)
 		c.opts.Username = authResult.identity // we might want to use authenticatingRule.Username, not the whole identity.
 		c.mu.Unlock()
