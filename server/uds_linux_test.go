@@ -155,6 +155,34 @@ func TestUDS_Auth_GetProcessSupplementalGroups(t *testing.T) {
 	}
 }
 
+func TestUDS_Auth_GroupsMatchesPrimaryGid(t *testing.T) {
+	// A synthetic primary gid that won't be in our real supplemental groups,
+	// proving getProcessGroups adds the primary gid from peer creds, not just
+	// the /proc "Groups:" line (which omits it).
+	const primary = 999998
+	creds := UDSPeerCreds{UID: os.Getuid(), GID: primary, PID: os.Getpid()}
+
+	ok, err := peerCredQueryGroups("groups", creds, int64(primary), nil)
+	if err != nil {
+		t.Fatalf("peerCredQueryGroups: %v", err)
+	}
+	if !ok {
+		t.Fatal("groups query should match the primary gid")
+	}
+
+	// The primary must not be duplicated if it is also a supplemental group.
+	groups, err := getProcessGroups(creds)
+	if err != nil {
+		t.Fatalf("getProcessGroups: %v", err)
+	}
+	seen := map[int]int{}
+	for _, g := range groups {
+		if seen[g]++; seen[g] > 1 {
+			t.Fatalf("getProcessGroups returned gid %d more than once: %v", g, groups)
+		}
+	}
+}
+
 func TestUDS_Auth_QueryPIDGID(t *testing.T) {
 	pid := os.Getpid()
 

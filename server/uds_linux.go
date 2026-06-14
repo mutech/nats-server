@@ -246,13 +246,31 @@ func getProcessSupplementalGroups(pid int) ([]int, error) {
 	return nil, fmt.Errorf("/proc/%d/status: Groups line not found", pid)
 }
 
-// peerCredQueryGroups matches GID against process supplemental groups.
+// getProcessGroups returns the peer's full group set: the primary gid from peer
+// credentials plus the supplemental groups from /proc/<pid>/status, deduplicated.
+// SO_PEERCRED carries the primary gid, which /proc's "Groups:" line omits.
+func getProcessGroups(c UDSPeerCreds) ([]int, error) {
+	supp, err := getProcessSupplementalGroups(c.PID)
+	if err != nil {
+		return nil, err
+	}
+	groups := make([]int, 0, len(supp)+1)
+	groups = append(groups, c.GID)
+	for _, g := range supp {
+		if g != c.GID {
+			groups = append(groups, g)
+		}
+	}
+	return groups, nil
+}
+
+// peerCredQueryGroups matches GID against the process group set (primary + supplemental).
 func peerCredQueryGroups(name string, c UDSPeerCreds, v any, _ map[string]any) (bool, error) {
 	gid, ok := v.(int64)
 	if !ok {
 		return false, fmt.Errorf("%s: expected int, got %T", name, v)
 	}
-	groups, err := getProcessSupplementalGroups(c.PID)
+	groups, err := getProcessGroups(c)
 	if err != nil {
 		return false, err
 	}
@@ -264,7 +282,7 @@ func peerCredQueryGroups(name string, c UDSPeerCreds, v any, _ map[string]any) (
 	return false, nil
 }
 
-// peerCredQueryGroupsName matches group name against process supplemental groups.
+// peerCredQueryGroupsName matches group name against the process group set (primary + supplemental).
 func peerCredQueryGroupsName(queryName string, c UDSPeerCreds, v any, _ map[string]any) (bool, error) {
 	name, ok := v.(string)
 	if !ok {
@@ -278,7 +296,7 @@ func peerCredQueryGroupsName(queryName string, c UDSPeerCreds, v any, _ map[stri
 	if err != nil {
 		return false, fmt.Errorf("invalid gid from lookup %q: %w", g.Gid, err)
 	}
-	groups, err := getProcessSupplementalGroups(c.PID)
+	groups, err := getProcessGroups(c)
 	if err != nil {
 		return false, err
 	}
