@@ -4439,16 +4439,24 @@ func (s *Server) LameDuckShutdown() {
 func (s *Server) lameDuckMode() {
 	s.mu.Lock()
 	// Check if there is actually anything to do
-	if s.isShuttingDown() || s.ldm || s.listener == nil {
+	if s.isShuttingDown() || s.ldm || (s.listener == nil && (s.uds == nil || s.uds.listener == nil)) {
 		s.mu.Unlock()
 		return
 	}
 	s.Noticef("Entering lame duck mode, stop accepting new clients")
 	s.ldm = true
 	s.sendLDMShutdownEventLocked()
-	expected := 1
-	s.listener.Close()
-	s.listener = nil
+	expected := 0
+	if s.listener != nil {
+		s.listener.Close()
+		s.listener = nil
+		expected++
+	}
+	if s.uds != nil && s.uds.listener != nil {
+		s.uds.listener.Close()
+		s.uds.listener = nil
+		expected++
+	}
 	expected += s.closeWebsocketServer()
 	s.ldmCh = make(chan bool, expected)
 	opts := s.getOpts()
