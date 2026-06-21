@@ -589,6 +589,13 @@ type Options struct {
 
 	// configDigest represents the state of configuration.
 	configDigest string
+
+	// CustomConfig holds the parsed results of custom top-level configuration
+	// sections registered via RegisterConfigSection, keyed by the lower-cased
+	// section name. It is populated while processing the configuration file and
+	// is not otherwise interpreted by the server; programs that embed the server
+	// read it to obtain their own configuration (e.g. a `myapp { ... }` block).
+	CustomConfig map[string]any
 }
 
 // WebsocketOpts are options for websocket
@@ -795,6 +802,12 @@ func (o *Options) Clone() *Options {
 	}
 	clone := &Options{}
 	*clone = *o
+	if o.CustomConfig != nil {
+		clone.CustomConfig = make(map[string]any, len(o.CustomConfig))
+		for k, v := range o.CustomConfig {
+			clone.CustomConfig[k] = v
+		}
+	}
 	if o.Users != nil {
 		clone.Users = make([]*User, len(o.Users))
 		for i, user := range o.Users {
@@ -1919,6 +1932,18 @@ func (o *Options) processConfigFileLine(k string, v any, errors *[]error, warnin
 		}
 		o.Proxies = proxies
 	default:
+		if handler, ok := lookupConfigSection(k); ok {
+			parsed, herr := handler(deepUnwrapConfigValue(v))
+			if herr != nil {
+				*errors = append(*errors, &configErr{tk, herr.Error()})
+				return
+			}
+			if o.CustomConfig == nil {
+				o.CustomConfig = make(map[string]any)
+			}
+			o.CustomConfig[strings.ToLower(k)] = parsed
+			return
+		}
 		if au := atomic.LoadInt32(&allowUnknownTopLevelField); au == 0 && !tk.IsUsedVariable() {
 			err := &unknownConfigFieldErr{
 				field: k,

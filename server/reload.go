@@ -1575,7 +1575,7 @@ func imposeOrder(value any) error {
 		slices.Sort(value.AllowedOrigins)
 	case string, bool, uint8, uint16, uint64, int, int32, int64, time.Duration, float64, nil, LeafNodeOpts, ClusterOpts, *tls.Config, PinnedCertSet,
 		*URLAccResolver, *MemAccResolver, *DirAccResolver, *CacheDirAccResolver, Authentication, MQTTOpts, jwt.TagList,
-		*OCSPConfig, map[string]string, map[string]bool, JSLimitOpts, StoreCipher, *OCSPResponseCacheConfig, *ProxiesConfig, WriteTimeoutPolicy, UDSOptions, []*UDSRule:
+		*OCSPConfig, map[string]string, map[string]bool, map[string]any, JSLimitOpts, StoreCipher, *OCSPResponseCacheConfig, *ProxiesConfig, WriteTimeoutPolicy, UDSOptions, []*UDSRule:
 		// explicitly skipped types
 	case *AuthCallout:
 	case JSTpmOpts:
@@ -1979,6 +1979,11 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 			if add, del := diffProxiesTrustedKeys(old.Trusted, new.Trusted); len(add) > 0 || len(del) > 0 {
 				diffOpts = append(diffOpts, &proxiesReload{add: add, del: del})
 			}
+		case "customconfig":
+			// Custom top-level sections registered via RegisterConfigSection are
+			// not interpreted by the server; reload is delegated to the section's
+			// optional reload handler. See config_section.go.
+			diffOpts = append(diffOpts, newCustomConfigReloadOption(oldValue, newValue))
 		default:
 			// TODO(ik): Implement String() on those options to have a nice print.
 			// %v is difficult to figure what's what, %+v print private fields and
