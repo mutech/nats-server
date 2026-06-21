@@ -14,7 +14,6 @@
 package server
 
 import (
-	"flag"
 	"fmt"
 	"strings"
 	"testing"
@@ -54,9 +53,10 @@ func parseAppSection(v any) (any, error) {
 	return cfg, nil
 }
 
-// TestRegisterConfigSectionEndToEnd exercises the feature through ConfigureOptions
-// — the same entry point a server binary's main() uses — proving that a custom
-// section is parsed when registered and refused when it is not.
+// TestRegisterConfigSectionEndToEnd exercises the feature through the real
+// config-loading path (ProcessConfigFile, which ConfigureOptions delegates to),
+// proving that a custom section is parsed when registered and refused when it is
+// not.
 func TestRegisterConfigSectionEndToEnd(t *testing.T) {
 	conf := createConfFile(t, []byte(`
 		port: 4222
@@ -67,12 +67,11 @@ func TestRegisterConfigSectionEndToEnd(t *testing.T) {
 		}
 	`))
 
-	// load mirrors a server binary's main(): a fresh flag set, "-c <file>", and
-	// no-op version/help callbacks.
+	// load goes through the same config-loading entry the server uses; we call
+	// ProcessConfigFile directly rather than ConfigureOptions so the test does
+	// not touch process-level (flag/signal) global state.
 	load := func() (*Options, error) {
-		fs := flag.NewFlagSet("server-test", flag.ContinueOnError)
-		noop := func() {}
-		return ConfigureOptions(fs, []string{"-c", conf}, noop, noop, noop)
+		return ProcessConfigFile(conf)
 	}
 
 	t.Run("registered section is parsed through the real entry point", func(t *testing.T) {
@@ -81,7 +80,7 @@ func TestRegisterConfigSectionEndToEnd(t *testing.T) {
 
 		opts, err := load()
 		if err != nil {
-			t.Fatalf("ConfigureOptions failed: %v", err)
+			t.Fatalf("ProcessConfigFile failed: %v", err)
 		}
 		if opts.Port != 4222 {
 			t.Fatalf("expected port 4222, got %d", opts.Port)
