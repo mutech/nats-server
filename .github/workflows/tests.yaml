@@ -167,6 +167,23 @@ jobs:
       - name: Run unit tests
         run: ./scripts/runTestsOnTravis.sh js_consumer_tests
 
+  config-section:
+    name: Test Config Sections
+    needs: [build-latest, build-supported, lint]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: stable
+
+      - name: Run unit tests
+        run: ./scripts/runTestsOnTravis.sh config_section_tests
+
   js-cluster-1:
     name: Test JetStream Cluster 1
     needs: [build-latest, build-supported, lint]
