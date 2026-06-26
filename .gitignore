@@ -53,3 +53,6 @@ coverage.out
 
 # Cross compiled binaries
 pkg
+
+# Dev-shell home ($PWD/user GOPATH from the system-nats flake)
+/user/
