@@ -1,4 +1,17 @@
-(This is for experimenting with features I need, see https://github.com/nats-io/nats-server/discussions/7677)
+This fork of the NATS server was planned to promote my UDS patches to NATS. It looks like the scope of the changes are not acceptable by upstream.
+
+I need these changes for a project of mine and keep the fork around in case NATS will reconsider adding them later on. However, due to my time constraints
+I probably can't keep up syncing changes, so there is a good chance this becomes a hard fork in the future.
+
+If you are interested in or need these changes and require robust support, I am - in principle - available for hire.
+
+The project I am working on is "System NATS" or snats. That's the working title. It's an embedded NATS server based on this fork that operates as a
+System BUS for Linux nodes. This in turn is part of the onpremix project, a site/organization/network/fleet management solution for on-premise deployments,
+e.g. home labs, small business infrastructure or alternative cloud/edge solutions. Both of these projects will be open source projects when they reach
+a sufficient maturity level. They are not yet public though.
+
+So while I am actively using this fork and maintain it for my use cases, it's not really supported in its current form. Following here is the original upstream
+README content:
 
 <p align="center">
   <img src="logos/nats-horizontal-color.png" width="300" alt="NATS Logo">
