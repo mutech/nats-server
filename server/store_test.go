@@ -24,6 +24,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nats-io/nats-server/v2/server/ats"
 	"github.com/nats-io/nats-server/v2/server/gsl"
 )
 
@@ -1135,6 +1136,158 @@ func TestStoreGetSeqFromTimeWithTrailingDeletes(t *testing.T) {
 	)
 }
 
+func TestStoreSkipMsgsCarryForwardLastTime(t *testing.T) {
+	testAllStoreAllPermutations(
+		t, false,
+		StreamConfig{Name: "zzz", Subjects: []string{"foo"}},
+		func(t *testing.T, fs StreamStore) {
+			// Store a message with an old timestamp.
+			old := time.Now().Add(-30 * 24 * time.Hour).UTC().Truncate(time.Second)
+			err := fs.StoreRawMsg("foo", nil, nil, 1, old.UnixNano(), 0, false)
+			require_NoError(t, err)
+
+			var ss StreamState
+			fs.FastState(&ss)
+			require_Equal(t, ss.LastSeq, 1)
+			require_Equal(t, ss.LastTime.UnixNano(), old.UnixNano())
+
+			// SkipMsgs should not move the last time forward.
+			require_NoError(t, fs.SkipMsgs(2, 10))
+			fs.FastState(&ss)
+			require_Equal(t, ss.LastSeq, 11)
+			require_Equal(t, ss.LastTime.UnixNano(), old.UnixNano())
+
+			// SkipMsg should not move the last time forward.
+			seq, err := fs.SkipMsg(12)
+			require_NoError(t, err)
+			require_Equal(t, seq, 12)
+			fs.FastState(&ss)
+			require_Equal(t, ss.LastSeq, 12)
+			require_Equal(t, ss.LastTime.UnixNano(), old.UnixNano())
+
+			// Another chained skip should not move the last time forward.
+			require_NoError(t, fs.SkipMsgs(13, 5))
+			fs.FastState(&ss)
+			require_Equal(t, ss.LastSeq, 17)
+			require_Equal(t, ss.LastTime.UnixNano(), old.UnixNano())
+
+			// Time-based lookups must resolve across the skip gaps.
+			newer := old.Add(15 * 24 * time.Hour)
+			err = fs.StoreRawMsg("foo", nil, nil, 18, newer.UnixNano(), 0, false)
+			require_NoError(t, err)
+			require_Equal(t, fs.GetSeqFromTime(old), 1)
+			require_Equal(t, fs.GetSeqFromTime(old.Add(5*24*time.Hour)), 18)
+			require_Equal(t, fs.GetSeqFromTime(newer), 18)
+		},
+	)
+}
+
+func TestStoreSkipMsgsCarryForwardLastTimeFromEmpty(t *testing.T) {
+	t.Run("SkipMsg", func(t *testing.T) {
+		testAllStoreAllPermutations(
+			t, false,
+			StreamConfig{Name: "zzz", Subjects: []string{"foo"}},
+			func(t *testing.T, fs StreamStore) {
+				var ss StreamState
+				fs.FastState(&ss)
+				require_Equal(t, ss.LastSeq, uint64(0))
+				require_True(t, ss.LastTime.IsZero())
+
+				// Zero state, so falls back to ats.AccessTime().
+				before := ats.AccessTime()
+				seq, err := fs.SkipMsg(0)
+				require_NoError(t, err)
+				require_Equal(t, seq, uint64(1))
+
+				fs.FastState(&ss)
+				require_Equal(t, ss.LastSeq, uint64(1))
+				require_False(t, ss.LastTime.IsZero())
+				require_True(t, ss.LastTime.UnixNano() >= before)
+				require_True(t, ss.LastTime.UnixNano() <= ats.AccessTime())
+				first := ss.LastTime
+
+				// Advance the clock; a subsequent skip must preserve the time.
+				time.Sleep(2 * ats.TickInterval)
+
+				seq, err = fs.SkipMsg(0)
+				require_NoError(t, err)
+				require_Equal(t, seq, uint64(2))
+
+				fs.FastState(&ss)
+				require_Equal(t, ss.LastSeq, uint64(2))
+				require_Equal(t, ss.LastTime.UnixNano(), first.UnixNano())
+			},
+		)
+	})
+
+	t.Run("SkipMsgs", func(t *testing.T) {
+		testAllStoreAllPermutations(
+			t, false,
+			StreamConfig{Name: "zzz", Subjects: []string{"foo"}},
+			func(t *testing.T, fs StreamStore) {
+				var ss StreamState
+				fs.FastState(&ss)
+				require_Equal(t, ss.LastSeq, uint64(0))
+				require_True(t, ss.LastTime.IsZero())
+
+				// Zero state, so falls back to ats.AccessTime().
+				before := ats.AccessTime()
+				require_NoError(t, fs.SkipMsgs(1, 5))
+
+				fs.FastState(&ss)
+				require_Equal(t, ss.LastSeq, uint64(5))
+				require_False(t, ss.LastTime.IsZero())
+				require_True(t, ss.LastTime.UnixNano() >= before)
+				require_True(t, ss.LastTime.UnixNano() <= ats.AccessTime())
+				first := ss.LastTime
+
+				// Advance the clock; a subsequent skip must preserve the time.
+				time.Sleep(2 * ats.TickInterval)
+
+				seq, err := fs.SkipMsg(0)
+				require_NoError(t, err)
+				require_Equal(t, seq, uint64(6))
+
+				fs.FastState(&ss)
+				require_Equal(t, ss.LastSeq, uint64(6))
+				require_Equal(t, ss.LastTime.UnixNano(), first.UnixNano())
+			},
+		)
+	})
+}
+
+func TestStoreSkipMsgNoInterestAdvancesLastTime(t *testing.T) {
+	testAllStoreAllPermutations(
+		t, false,
+		StreamConfig{Name: "zzz", Subjects: []string{"foo"}},
+		func(t *testing.T, fs StreamStore) {
+			// A skip without interest still increases the sequence.
+			seq, err := fs.SkipMsgNoInterest(0)
+			require_NoError(t, err)
+			require_Equal(t, seq, uint64(1))
+
+			var ss StreamState
+			fs.FastState(&ss)
+			require_Equal(t, ss.Msgs, uint64(0))
+			require_Equal(t, ss.LastSeq, uint64(1))
+			first := ss.LastTime
+
+			// Let the clock advance past the access time service granularity.
+			time.Sleep(2 * ats.TickInterval)
+
+			// The second skip still has no interest, but should update both the sequence and time.
+			seq, err = fs.SkipMsgNoInterest(0)
+			require_NoError(t, err)
+			require_Equal(t, seq, uint64(2))
+
+			fs.FastState(&ss)
+			require_Equal(t, ss.Msgs, uint64(0))
+			require_Equal(t, ss.LastSeq, uint64(2))
+			require_True(t, ss.LastTime.After(first))
+		},
+	)
+}
+
 func TestFileStoreMultiLastSeqsAndLoadLastMsgWithLazySubjectState(t *testing.T) {
 	testAllStoreAllPermutations(
 		t, false,
@@ -1167,6 +1320,41 @@ func TestFileStoreMultiLastSeqsAndLoadLastMsgWithLazySubjectState(t *testing.T) 
 			sm, err = fs.LoadLastMsg("foo", nil)
 			require_NoError(t, err)
 			require_Equal(t, sm.seq, 2)
+		},
+	)
+}
+
+func TestStoreNumPendingLastPerSubjectExcludeOvercount(t *testing.T) {
+	testAllStoreAllPermutations(
+		t, false,
+		StreamConfig{Name: "zzz", Subjects: []string{"foo.*"}},
+		func(t *testing.T, fs StreamStore) {
+			put := func(subj string) {
+				_, _, err := fs.StoreMsg(subj, nil, []byte("x"), 0)
+				require_NoError(t, err)
+			}
+			// foo.A occupies seqs 1-10 (entirely below our start seq).
+			for range 10 {
+				put("foo.A")
+			}
+			put("foo.B")                              // seq 11
+			put("foo.C")                              // seq 12
+			require_NoError(t, fs.SkipMsgs(13, 87))   // skip 13-99
+			put("foo.B")                              // seq 100
+			require_NoError(t, fs.SkipMsgs(101, 899)) // skip 101-999
+			put("foo.C")                              // seq 1000
+
+			// lastPerSubject starting at seq 13: foo.A's last (10) is below 13 so it
+			// contributes 0; foo.B (last 100) and foo.C (last 1000) each contribute 1.
+			total, _, err := fs.NumPending(13, "foo.*", true)
+			require_NoError(t, err)
+			require_Equal(t, total, 2)
+
+			filters := gsl.NewSublist[struct{}]()
+			filters.Insert("foo.*", struct{}{})
+			total, _, err = fs.NumPendingMulti(13, filters, true)
+			require_NoError(t, err)
+			require_Equal(t, total, 2)
 		},
 	)
 }

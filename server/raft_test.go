@@ -25,6 +25,7 @@ import (
 	"path"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -167,6 +168,26 @@ func TestNRGAppendEntryDecodeTruncatedEntryLength(t *testing.T) {
 	truncated := buf[:appendEntryBaseLen+2]
 	_, err = decodeAppendEntry(truncated, nil, _EMPTY_)
 	require_Error(t, err, errBadAppendEntry)
+}
+
+func TestNRGPeerStateDecodeTruncated(t *testing.T) {
+	ps := &peerState{knownPeers: []string{"12345678", "abcdefgh"}, clusterSize: 2}
+	buf := encodePeerState(ps)
+
+	// Sanity check the round trip.
+	dps, err := decodePeerState(buf)
+	require_NoError(t, err)
+	require_Equal(t, len(dps.knownPeers), 2)
+	require_Equal(t, dps.clusterSize, 2)
+
+	// Header claims one peer but only a partial id (idLen-5 bytes) follows.
+	// len == cap so the partial id can not be read past the slice.
+	truncated := make([]byte, 8+idLen-5)
+	le := binary.LittleEndian
+	le.PutUint32(truncated[0:], 1)
+	le.PutUint32(truncated[4:], 1)
+	_, err = decodePeerState(truncated)
+	require_Error(t, err, errCorruptPeers)
 }
 
 func TestNRGRecoverFromFollowingNoLeader(t *testing.T) {
@@ -1290,6 +1311,163 @@ func TestNRGTruncateWALClearsPendingAppendEntryCache(t *testing.T) {
 	// the cache (bypassing the WAL load path).
 	require_Len(t, len(n.pae), 1)
 	require_NotNil(t, n.pae[1])
+}
+
+func TestNRGTruncateWALRevertsUncommittedAddPeer(t *testing.T) {
+	const (
+		KindLeader = iota
+		KindFollower
+		KindRestart
+	)
+	test := func(kind int) {
+		n, cleanup := initSingleMemRaftNode(t)
+		defer cleanup()
+
+		nats0 := "S1Nunr6R"   // "nats-0"
+		newPeer := "yrzKKRBu" // "nats-1"
+		n.addPeer(nats0)
+		require_Len(t, len(n.peers), 2)
+
+		esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+		normal := []*Entry{newEntry(EntryNormal, esm)}
+		addPeer := newEntry(EntryAddPeer, []byte(newPeer))
+
+		if kind == KindLeader {
+			n.switchToLeader()
+			n.sendMembershipChange(addPeer)
+		} else {
+			// Store a normal entry, then an uncommitted AddPeer entry.
+			ae1 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: normal})
+			ae2 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 1, pindex: 1, entries: []*Entry{addPeer}})
+			aesub := n.aesub
+			if kind == KindRestart {
+				aesub = nil
+			}
+			n.processAppendEntry(ae1, aesub)
+			n.processAppendEntry(ae2, aesub)
+		}
+
+		// The peer is tracked speculatively, and a membership change is now inflight.
+		require_Equal(t, n.pindex, 2)
+		_, ok := n.peers[newPeer]
+		require_True(t, ok)
+		require_Equal(t, n.csz, 3)
+		require_Equal(t, n.qn, 2)
+		require_NotNil(t, n.membChange)
+		require_Equal(t, n.membChange.index, 2)
+		require_Equal(t, n.membChange.peer, newPeer)
+		require_True(t, n.membChange.prev == nil)
+
+		// Raftz should report the new peer as not known/committed yet.
+		rz := n.s.Raftz(&RaftzOptions{AccountFilter: globalAccountName})
+		require_NotNil(t, rz)
+		gz := (*rz)[globalAccountName]["TEST"]
+		require_NotNil(t, gz)
+		require_Len(t, len(gz.Peers), 2)
+		require_True(t, gz.Peers[nats0].Known)
+		require_False(t, gz.Peers[newPeer].Known)
+
+		// Truncate the uncommitted AddPeer entry. Its speculative effects must be reverted.
+		n.truncateWAL(1, 1)
+		require_Equal(t, n.pindex, 1)
+		_, ok = n.peers[newPeer]
+		require_False(t, ok)
+		require_Equal(t, n.csz, 2)
+		require_Equal(t, n.qn, 2)
+		require_True(t, n.membChange == nil)
+
+		// Raftz should also be reverted.
+		rz = n.s.Raftz(&RaftzOptions{AccountFilter: globalAccountName})
+		require_NotNil(t, rz)
+		gz = (*rz)[globalAccountName]["TEST"]
+		require_NotNil(t, gz)
+		require_Len(t, len(gz.Peers), 1)
+		require_True(t, gz.Peers[nats0].Known)
+	}
+
+	t.Run("Leader", func(t *testing.T) { test(KindLeader) })
+	t.Run("Follower", func(t *testing.T) { test(KindFollower) })
+	t.Run("Restart", func(t *testing.T) { test(KindRestart) })
+}
+
+func TestNRGTruncateWALRevertsUncommittedRemovePeer(t *testing.T) {
+	const (
+		KindLeader = iota
+		KindFollower
+		KindRestart
+	)
+	test := func(kind int) {
+		n, cleanup := initSingleMemRaftNode(t)
+		defer cleanup()
+
+		nats0 := "S1Nunr6R"   // "nats-0"
+		oldPeer := "yrzKKRBu" // "nats-1"
+		n.addPeer(nats0)
+		n.addPeer(oldPeer)
+		require_Len(t, len(n.peers), 3)
+
+		esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+		normal := []*Entry{newEntry(EntryNormal, esm)}
+		removePeer := newEntry(EntryRemovePeer, []byte(oldPeer))
+
+		if kind == KindLeader {
+			n.switchToLeader()
+			n.sendMembershipChange(removePeer)
+		} else {
+			// Store a normal entry, then an uncommitted AddPeer entry.
+			ae1 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: normal})
+			ae2 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 1, pindex: 1, entries: []*Entry{removePeer}})
+			aesub := n.aesub
+			if kind == KindRestart {
+				aesub = nil
+			}
+			n.processAppendEntry(ae1, aesub)
+			n.processAppendEntry(ae2, aesub)
+		}
+
+		// The peer is gone and quorum shrank.
+		_, ok := n.peers[oldPeer]
+		require_False(t, ok)
+		require_Equal(t, n.csz, 2)
+		require_Equal(t, n.qn, 2)
+		_, ok = n.removed[oldPeer]
+		require_False(t, ok)
+		require_NotNil(t, n.membChange)
+		require_Equal(t, n.membChange.index, 2)
+		require_Equal(t, n.membChange.peer, oldPeer)
+		require_NotNil(t, n.membChange.prev)
+
+		// Raftz shouldn't report the to-be-removed peer anymore.
+		rz := n.s.Raftz(&RaftzOptions{AccountFilter: globalAccountName})
+		require_NotNil(t, rz)
+		gz := (*rz)[globalAccountName]["TEST"]
+		require_NotNil(t, gz)
+		require_Len(t, len(gz.Peers), 1)
+		require_True(t, gz.Peers[nats0].Known)
+
+		// Truncate the uncommitted RemovePeer entry. Its speculative effects must be reverted.
+		n.truncateWAL(1, 1)
+		_, ok = n.peers[oldPeer]
+		require_True(t, ok)
+		require_Equal(t, n.csz, 3)
+		require_Equal(t, n.qn, 2)
+		_, ok = n.removed[oldPeer]
+		require_False(t, ok)
+		require_True(t, n.membChange == nil)
+
+		// Raftz should also be reverted.
+		rz = n.s.Raftz(&RaftzOptions{AccountFilter: globalAccountName})
+		require_NotNil(t, rz)
+		gz = (*rz)[globalAccountName]["TEST"]
+		require_NotNil(t, gz)
+		require_Len(t, len(gz.Peers), 2)
+		require_True(t, gz.Peers[nats0].Known)
+		require_True(t, gz.Peers[oldPeer].Known)
+	}
+
+	t.Run("Leader", func(t *testing.T) { test(KindLeader) })
+	t.Run("Follower", func(t *testing.T) { test(KindFollower) })
+	t.Run("Restart", func(t *testing.T) { test(KindRestart) })
 }
 
 func TestNRGResetWALClearsPendingAppendEntryCache(t *testing.T) {
@@ -4160,9 +4338,6 @@ func TestNRGQuorumAfterLeaderStepdown(t *testing.T) {
 	require_NoError(t, n.trackPeer(nats1))
 	require_True(t, n.Quorum())
 	require_Len(t, len(n.peers), 3)
-	for _, ps := range n.peers {
-		ps.kp = true
-	}
 
 	// If we hand off leadership to another server, we should
 	// still be reporting we have quorum.
@@ -4834,17 +5009,17 @@ func TestNRGUncommittedMembershipChangeGetsTruncated(t *testing.T) {
 	n.processAppendEntry(aeAddPeer, n.aesub)
 	require_Equal(t, n.pindex, 2)
 	require_True(t, n.MembershipChangeInProgress())
-	require_Equal(t, n.membChangeIndex, 2)
+	require_Equal(t, n.membChange.index, 2)
 
 	// If the entry containing the membership change isn't truncated, it should remain in progress.
 	n.truncateWAL(n.pterm, n.pindex)
 	require_True(t, n.MembershipChangeInProgress())
-	require_Equal(t, n.membChangeIndex, 2)
+	require_Equal(t, n.membChange.index, 2)
 
 	// If the entry IS truncated, then it shouldn't be in progress anymore.
 	n.truncateWAL(n.pterm, n.pindex-1)
 	require_False(t, n.MembershipChangeInProgress())
-	require_Equal(t, n.membChangeIndex, 0)
+	require_True(t, n.membChange == nil)
 }
 
 func TestNRGUncommittedMembershipChangeOnNewLeaderForwardedRemovePeerProposal(t *testing.T) {
@@ -5841,6 +6016,140 @@ func TestNRGReplayAddPeerKeepsClusterSize(t *testing.T) {
 	fs.Stop()
 }
 
+func TestNRGSnapshotExcludesUncommittedMembershipChange(t *testing.T) {
+	esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+
+	t.Run("AddPeer", func(t *testing.T) {
+		n, cleanup := initSingleMemRaftNode(t)
+		defer cleanup()
+
+		nats0 := "S1Nunr6R"   // "nats-0"
+		newPeer := "yrzKKRBu" // "nats-1"
+
+		n.Lock()
+		n.addPeer(nats0)
+		n.Unlock()
+		require_Equal(t, len(n.peers), 2)
+
+		aeMsg := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: []*Entry{newEntry(EntryNormal, esm)}})
+		aeAddPeer := encode(t, &appendEntry{leader: nats0, term: 1, commit: 1, pterm: 1, pindex: 1, entries: []*Entry{newEntry(EntryAddPeer, []byte(newPeer))}})
+		n.processAppendEntry(aeMsg, n.aesub)
+		n.processAppendEntry(aeAddPeer, n.aesub)
+
+		// The peer is tracked speculatively and the change is inflight at index 2.
+		require_Equal(t, n.commit, 1)
+		_, ok := n.peers[newPeer]
+		require_True(t, ok)
+		require_Equal(t, n.csz, 3)
+		require_NotNil(t, n.membChange)
+		require_Equal(t, n.membChange.index, 2)
+
+		// Apply the committed normal entry, then snapshot at applied (index 1).
+		n.Applied(1)
+		require_NoError(t, n.InstallSnapshot(nil, false))
+
+		// The snapshot's peer state must reflect committed membership only,
+		// i.e. it must not contain the not-yet-committed peer.
+		snap, err := n.loadLastSnapshot()
+		require_NoError(t, err)
+		require_Equal(t, snap.lastIndex, 1)
+		ps, err := decodePeerState(snap.peerstate)
+		require_NoError(t, err)
+		require_Equal(t, ps.clusterSize, 2)
+		require_Len(t, len(ps.knownPeers), 2)
+		require_False(t, slices.Contains(ps.knownPeers, newPeer))
+	})
+
+	t.Run("RemovePeer", func(t *testing.T) {
+		n, cleanup := initSingleMemRaftNode(t)
+		defer cleanup()
+
+		nats0 := "S1Nunr6R"   // "nats-0"
+		oldPeer := "yrzKKRBu" // "nats-1"
+
+		n.Lock()
+		n.addPeer(nats0)
+		n.addPeer(oldPeer)
+		n.Unlock()
+		require_Equal(t, len(n.peers), 3)
+
+		aeMsg := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: []*Entry{newEntry(EntryNormal, esm)}})
+		aeRemovePeer := encode(t, &appendEntry{leader: nats0, term: 1, commit: 1, pterm: 1, pindex: 1, entries: []*Entry{newEntry(EntryRemovePeer, []byte(oldPeer))}})
+		n.processAppendEntry(aeMsg, n.aesub)
+		n.processAppendEntry(aeRemovePeer, n.aesub)
+
+		// The peer is removed speculatively and the change is inflight at index 2.
+		require_Equal(t, n.commit, 1)
+		_, ok := n.peers[oldPeer]
+		require_False(t, ok)
+		require_Equal(t, n.csz, 2)
+		require_NotNil(t, n.membChange)
+		require_Equal(t, n.membChange.index, 2)
+
+		// Apply the committed normal entry, then snapshot at applied (index 1).
+		n.Applied(1)
+		require_NoError(t, n.InstallSnapshot(nil, false))
+
+		// The snapshot's peer state must reflect committed membership only,
+		// i.e. it must still include the not-yet-removed peer.
+		snap, err := n.loadLastSnapshot()
+		require_NoError(t, err)
+		require_Equal(t, snap.lastIndex, 1)
+		ps, err := decodePeerState(snap.peerstate)
+		require_NoError(t, err)
+		require_Equal(t, ps.clusterSize, 3)
+		require_Len(t, len(ps.knownPeers), 3)
+		require_True(t, slices.Contains(ps.knownPeers, oldPeer))
+	})
+}
+
+func TestNRGDontSwitchToCandidateWithInflightSelfMembershipChange(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+
+	nats0 := "S1Nunr6R" // "nats-0"
+	nats1 := "yrzKKRBu" // "nats-1"
+
+	n.Lock()
+	n.addPeer(nats0)
+	n.addPeer(nats1)
+	n.Unlock()
+	require_Equal(t, len(n.peers), 3)
+
+	// Receive an uncommitted EntryRemovePeer that targets us.
+	aeMsg := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: []*Entry{newEntry(EntryNormal, esm)}})
+	aeRemoveSelf := encode(t, &appendEntry{leader: nats0, term: 1, commit: 1, pterm: 1, pindex: 1, entries: []*Entry{newEntry(EntryRemovePeer, []byte(n.id))}})
+	n.processAppendEntry(aeMsg, n.aesub)
+	n.processAppendEntry(aeRemoveSelf, n.aesub)
+
+	// We've speculatively removed ourselves, and the change is inflight at index 2.
+	_, ok := n.peers[n.id]
+	require_False(t, ok)
+	require_NotNil(t, n.membChange)
+	require_Equal(t, n.membChange.peer, n.id)
+	require_Equal(t, n.membChange.index, 2)
+
+	// We must not become a candidate while our own removal is uncommitted.
+	n.Applied(1)
+	n.switchToCandidate()
+	require_Equal(t, n.State(), Follower)
+
+	// Truncate the uncommitted removal back to the committed index. This
+	// restores us to our own peer set and clears the inflight change.
+	n.Lock()
+	n.truncateWAL(1, 1)
+	n.Unlock()
+	_, ok = n.peers[n.id]
+	require_True(t, ok)
+	require_True(t, n.membChange == nil)
+
+	// Now that we're a settled member again, we can campaign.
+	n.switchToCandidate()
+	require_Equal(t, n.State(), Candidate)
+}
+
 func TestNRGTrackPeerLag(t *testing.T) {
 	c := createJetStreamClusterExplicit(t, "R3S", 3)
 	defer c.shutdown()
@@ -6247,6 +6556,55 @@ func TestNRGPausingQuorumCancelsCatchup(t *testing.T) {
 	t.Run("AlreadyPaused", func(t *testing.T) { test(t, true) })
 }
 
+func TestNRGApplyCommitDoesNotResetWALAtSnapshotBoundary(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	nats0 := "S1Nunr6R" // "nats-0"
+	esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+	entry := []*Entry{newEntry(EntryNormal, esm)}
+
+	// Build a WAL with 3 entries.
+	ae1 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: entry})
+	ae2 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 1, pindex: 1, entries: entry})
+	ae3 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 1, pindex: 2, entries: entry})
+	n.processAppendEntry(ae1, n.aesub)
+	n.processAppendEntry(ae2, n.aesub)
+	n.processAppendEntry(ae3, n.aesub)
+	require_Equal(t, n.pindex, 3)
+	require_Equal(t, n.commit, 0)
+
+	// Install a snapshot past our commit, not overwriting commit here.
+	snap := &snapshot{
+		lastTerm:  1,
+		lastIndex: 2,
+		peerstate: encodePeerState(&peerState{n.peerNames(), n.csz, n.extSt}),
+	}
+	n.Lock()
+	require_NoError(t, n.installSnapshot(snap))
+	n.Unlock()
+	require_Equal(t, n.papplied, 2)
+	require_Equal(t, n.commit, 0)
+
+	var before StreamState
+	n.wal.FastState(&before)
+	require_Equal(t, before.FirstSeq, 3)
+	require_Equal(t, before.Msgs, 1)
+
+	// A heartbeat advances commit through the snapshot boundary. The apply loop
+	// should skip entries that are already compacted away.
+	aeHeartbeat := encode(t, &appendEntry{leader: nats0, term: 1, commit: 3, pterm: 1, pindex: 3, entries: nil})
+	n.processAppendEntry(aeHeartbeat, n.aesub)
+
+	// The WAL must be intact: entry 3 still present, no reset to [0,0].
+	var after StreamState
+	n.wal.FastState(&after)
+	require_Equal(t, after.FirstSeq, 3)
+	require_Equal(t, after.Msgs, 1)
+	// And we should have applied past the snapshot boundary up to the new commit.
+	require_Equal(t, n.commit, 3)
+}
+
 func TestNRGProcessAppendEntryTermMismatchDoesNotRegressCommit(t *testing.T) {
 	n, cleanup := initSingleMemRaftNode(t)
 	defer cleanup()
@@ -6315,7 +6673,7 @@ func TestNRGReset(t *testing.T) {
 
 	// Add another peer in addition to ourselves.
 	other := nats1
-	n.peers[other] = &lps{time.Time{}, 0, true}
+	n.peers[other] = &lps{time.Time{}, 0}
 	n.adjustClusterSizeAndQuorum()
 	n.updateLeader(other)
 
