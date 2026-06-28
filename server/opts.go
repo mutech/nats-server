@@ -2973,7 +2973,7 @@ func parseLeafAuthorization(v any, errors, warnings *[]error) (*authorization, e
 				*errors = append(*errors, &configErr{tk, err.Error()})
 				continue
 			}
-			if !nkeys.IsValidPublicUserKey(nk) {
+			if !isFileRef(nk) && !nkeys.IsValidPublicUserKey(nk) {
 				*errors = append(*errors, &configErr{tk, "Not a valid public nkey for leafnode authorization"})
 			}
 			auth.nkey = nk
@@ -3152,10 +3152,12 @@ func parseRemoteLeafNodes(v any, errors *[]error, warnings *[]error) ([]*RemoteL
 					*errors = append(*errors, &configErr{tk, err.Error()})
 					continue
 				}
-				if pb, _, err := nkeys.DecodeSeed([]byte(nk)); err != nil || pb != nkeys.PrefixByteUser {
-					err := &configErr{tk, fmt.Sprintf("Remote leafnode nkey is not a valid seed: %q", v)}
-					*errors = append(*errors, err)
-					continue
+				if !isFileRef(nk) {
+					if pb, _, err := nkeys.DecodeSeed([]byte(nk)); err != nil || pb != nkeys.PrefixByteUser {
+						err := &configErr{tk, fmt.Sprintf("Remote leafnode nkey is not a valid seed: %q", v)}
+						*errors = append(*errors, err)
+						continue
+					}
 				}
 				if remote.Credentials != _EMPTY_ {
 					*errors = append(*errors, &configErr{tk, "Remote leafnode can not have both creds and nkey defined"})
@@ -3747,7 +3749,7 @@ func parseAccounts(v any, opts *Options, errors *[]error, warnings *[]error) err
 							continue
 						}
 					}
-					if !ok || !nkeys.IsValidPublicAccountKey(nk) {
+					if !ok || (!isFileRef(nk) && !nkeys.IsValidPublicAccountKey(nk)) {
 						err := &configErr{tk, fmt.Sprintf("Not a valid public nkey for an account: %q", mv)}
 						*errors = append(*errors, err)
 						continue
@@ -6683,6 +6685,11 @@ func expandPath(p string) (string, error) {
 // referenced file is read synchronously and its trimmed contents are returned, so
 // nkeys (seeds in particular) need not be inlined in the config file — keeping
 // them out of the (world-readable) nix store. Any other value is returned as-is.
+//
+// When the referenced file is absent the reference is returned unchanged rather
+// than erroring: this is the build-time `snatsd -t` case, where the secret has
+// not been deployed yet. Callers skip key validation for an unresolved reference
+// (see isFileRef); at runtime the file exists and the value resolves normally.
 func resolveNkeyValue(s string) (string, error) {
 	u, err := url.Parse(s)
 	if err != nil || u.Scheme != "file" {
@@ -6690,9 +6697,17 @@ func resolveNkeyValue(s string) (string, error) {
 	}
 	b, err := os.ReadFile(filepath.Clean(u.Path))
 	if err != nil {
-		return _EMPTY_, err
+		return s, nil
 	}
 	return strings.TrimSpace(string(b)), nil
+}
+
+// isFileRef reports whether s is still an unresolved "file://" nkey reference,
+// i.e. resolveNkeyValue could not read the file (absent at config-check time).
+// Validation of such a value is deferred to runtime, when the file is present.
+func isFileRef(s string) bool {
+	u, err := url.Parse(s)
+	return err == nil && u.Scheme == "file"
 }
 
 // RedactArgs redacts sensitive arguments from the command line.

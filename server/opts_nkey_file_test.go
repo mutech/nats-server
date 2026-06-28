@@ -91,9 +91,17 @@ func TestResolveNkeyValue(t *testing.T) {
 		t.Fatalf("resolveNkeyValue(file) = %q, want %q", got, pub)
 	}
 
-	// Missing file is an error.
-	if _, err := resolveNkeyValue("file:///no/such/snats/nkey/file"); err == nil {
-		t.Fatalf("expected error for missing file")
+	// Missing file: deferred — the reference is returned unchanged, no error
+	// (build-time `snatsd -t` before the secret is deployed). isFileRef flags it.
+	ref := "file:///no/such/snats/nkey/file"
+	if got, err := resolveNkeyValue(ref); err != nil || got != ref {
+		t.Fatalf("missing file should defer to %q, got %q err %v", ref, got, err)
+	}
+	if !isFileRef(ref) {
+		t.Fatalf("isFileRef(%q) = false, want true", ref)
+	}
+	if isFileRef(pub) {
+		t.Fatalf("isFileRef(%q) = true, want false (resolved key)", pub)
 	}
 }
 
@@ -145,6 +153,18 @@ func TestNkeyFileLeafRemoteSeed(t *testing.T) {
 			t.Fatalf("expected error: account key is not a user seed")
 		}
 	})
+
+	t.Run("missing file defers (parses; seed validation skipped)", func(t *testing.T) {
+		ref := "file:///no/such/snats/seed"
+		cf := createConfFile(t, []byte(conf(ref)))
+		opts, err := ProcessConfigFile(cf)
+		if err != nil {
+			t.Fatalf("deferred parse should succeed (build-time -t), got: %v", err)
+		}
+		if got := opts.LeafNode.Remotes[0].Nkey; got != ref {
+			t.Fatalf("remote nkey = %q, want unresolved ref %q", got, ref)
+		}
+	})
 }
 
 func TestNkeyFileLeafAuthorization(t *testing.T) {
@@ -179,6 +199,18 @@ func TestNkeyFileLeafAuthorization(t *testing.T) {
 		cf := createConfFile(t, []byte(conf(secretFile(t, "not-a-pubkey"))))
 		if _, err := ProcessConfigFile(cf); err == nil {
 			t.Fatalf("expected public user key validation error")
+		}
+	})
+
+	t.Run("missing file defers (parses; pubkey validation skipped)", func(t *testing.T) {
+		ref := "file:///no/such/snats/pub"
+		cf := createConfFile(t, []byte(conf(ref)))
+		opts, err := ProcessConfigFile(cf)
+		if err != nil {
+			t.Fatalf("deferred parse should succeed, got: %v", err)
+		}
+		if opts.LeafNode.Nkey != ref {
+			t.Fatalf("leaf authz nkey = %q, want unresolved ref %q", opts.LeafNode.Nkey, ref)
 		}
 	})
 }
@@ -217,6 +249,19 @@ func TestNkeyFileAccount(t *testing.T) {
 		cf := createConfFile(t, []byte(conf(secretFile(t, "not-an-account-key"))))
 		if _, err := ProcessConfigFile(cf); err == nil {
 			t.Fatalf("expected account key validation error")
+		}
+	})
+
+	t.Run("missing file defers (parses; account-key validation skipped)", func(t *testing.T) {
+		ref := "file:///no/such/snats/acc"
+		cf := createConfFile(t, []byte(conf(ref)))
+		opts, err := ProcessConfigFile(cf)
+		if err != nil {
+			t.Fatalf("deferred parse should succeed, got: %v", err)
+		}
+		acc := findAccount(opts, "A")
+		if acc == nil || acc.Nkey != ref {
+			t.Fatalf("account nkey = %v, want unresolved ref %q", acc, ref)
 		}
 	})
 }
