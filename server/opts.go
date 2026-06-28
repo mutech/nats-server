@@ -2968,7 +2968,11 @@ func parseLeafAuthorization(v any, errors, warnings *[]error) (*authorization, e
 		case "pass", "password":
 			auth.pass = mv.(string)
 		case "nkey":
-			nk := mv.(string)
+			nk, err := resolveNkeyValue(mv.(string))
+			if err != nil {
+				*errors = append(*errors, &configErr{tk, err.Error()})
+				continue
+			}
 			if !nkeys.IsValidPublicUserKey(nk) {
 				*errors = append(*errors, &configErr{tk, "Not a valid public nkey for leafnode authorization"})
 			}
@@ -3143,7 +3147,11 @@ func parseRemoteLeafNodes(v any, errors *[]error, warnings *[]error) ([]*RemoteL
 				}
 				remote.Credentials = p
 			case "nkey", "seed":
-				nk := v.(string)
+				nk, err := resolveNkeyValue(v.(string))
+				if err != nil {
+					*errors = append(*errors, &configErr{tk, err.Error()})
+					continue
+				}
 				if pb, _, err := nkeys.DecodeSeed([]byte(nk)); err != nil || pb != nkeys.PrefixByteUser {
 					err := &configErr{tk, fmt.Sprintf("Remote leafnode nkey is not a valid seed: %q", v)}
 					*errors = append(*errors, err)
@@ -3732,6 +3740,13 @@ func parseAccounts(v any, opts *Options, errors *[]error, warnings *[]error) err
 				switch strings.ToLower(k) {
 				case "nkey":
 					nk, ok := mv.(string)
+					if ok {
+						var rerr error
+						if nk, rerr = resolveNkeyValue(nk); rerr != nil {
+							*errors = append(*errors, &configErr{tk, rerr.Error()})
+							continue
+						}
+					}
 					if !ok || !nkeys.IsValidPublicAccountKey(nk) {
 						err := &configErr{tk, fmt.Sprintf("Not a valid public nkey for an account: %q", mv)}
 						*errors = append(*errors, err)
@@ -4697,7 +4712,12 @@ func parseUsers(mv any, errors *[]error) ([]*NkeyUser, []*User, []*UDSRule, erro
 
 			switch strings.ToLower(k) {
 			case "nkey":
-				nkey.Nkey = v.(string)
+				nk, err := resolveNkeyValue(v.(string))
+				if err != nil {
+					*errors = append(*errors, &configErr{tk, err.Error()})
+					continue
+				}
+				nkey.Nkey = nk
 			case "user", "username":
 				user.Username = v.(string)
 				rule.Username = v.(string)
@@ -6657,6 +6677,22 @@ func expandPath(p string) (string, error) {
 	}
 
 	return filepath.Join(home, p[1:]), nil
+}
+
+// resolveNkeyValue resolves a configured nkey value. If it is a "file://" URL the
+// referenced file is read synchronously and its trimmed contents are returned, so
+// nkeys (seeds in particular) need not be inlined in the config file — keeping
+// them out of the (world-readable) nix store. Any other value is returned as-is.
+func resolveNkeyValue(s string) (string, error) {
+	u, err := url.Parse(s)
+	if err != nil || u.Scheme != "file" {
+		return s, nil
+	}
+	b, err := os.ReadFile(filepath.Clean(u.Path))
+	if err != nil {
+		return _EMPTY_, err
+	}
+	return strings.TrimSpace(string(b)), nil
 }
 
 // RedactArgs redacts sensitive arguments from the command line.
