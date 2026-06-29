@@ -6,7 +6,7 @@ I probably can't keep up syncing changes, so there is a good chance this becomes
 If you are interested in or need these changes and require robust support, I am - in principle - available for hire.
 
 The project I am working on is "System NATS" or snats. That's the working title. It's an embedded NATS server based on this fork that operates as a
-System BUS for Linux nodes. This in turn is part of the onpremix project, a site/organization/network/fleet management solution for on-premise deployments,
+system bus for Linux nodes (similar to DBUS) integrating into a communication mesh. This in turn is part of the onpremix project, a site/organization/network/fleet management solution for on-premise deployments,
 e.g. home labs, small business infrastructure or alternative cloud/edge solutions. Both of these projects will be open source projects when they reach
 a sufficient maturity level. They are not yet public though.
 
