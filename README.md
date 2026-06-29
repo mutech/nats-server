@@ -1,4 +1,4 @@
-This fork of the NATS server was planned to promote my UDS patches to NATS. It looks like the scope of the changes are not acceptable by upstream.
+This fork of the NATS server was planned to promote my UDS patches to NATS. It looks like the scope of the changes is not acceptable by upstream.
 
 I need these changes for a project of mine and keep the fork around in case NATS will reconsider adding them later on. However, due to my time constraints
 I probably can't keep up syncing changes, so there is a good chance this becomes a hard fork in the future.
@@ -10,8 +10,36 @@ System BUS for Linux nodes. This in turn is part of the onpremix project, a site
 e.g. home labs, small business infrastructure or alternative cloud/edge solutions. Both of these projects will be open source projects when they reach
 a sufficient maturity level. They are not yet public though.
 
-So while I am actively using this fork and maintain it for my use cases, it's not really supported in its current form. Following here is the original upstream
-README content:
+So while I am actively using this fork and maintain it for my use cases, it's not really supported in its current form.
+
+## Changes in this fork
+
+Full documentation is in the [wiki](https://github.com/mutech/nats-server/wiki):
+
+- **UNIX domain sockets** (*implemented*) — a UDS transport for the server, with
+  peer-credential (uid/gid/pid) authentication. See
+  [UNIX domain sockets](https://github.com/mutech/nats-server/wiki/UNIX-domain-sockets)
+  and the [UDS permission model](https://github.com/mutech/nats-server/wiki/UDS-Permission-Model).
+- **`file://` nkey references** (*implemented*) — any nkey or seed in the config
+  may be a `file://` URL, read at runtime, so secrets stay out of the config
+  file. See [NKey file references](https://github.com/mutech/nats-server/wiki/NKey-file-references).
+- **Peer authorization** (*planned*) — propagate the publisher's identity to
+  subscribers. See [Peer authorization](https://github.com/mutech/nats-server/wiki/Peer-authorization).
+
+## Related projects
+
+The UDS transport needs a client that can dial a Unix socket. These companion
+forks add that:
+
+- [natscli](https://github.com/mutech/natscli) — the `nats` CLI, with a
+  `nats+uds://` URL scheme for UDS connections.
+- [nats.py](https://github.com/mutech/nats.py) — Python client with UDS support.
+- [nats.zig](https://github.com/mutech/nats.zig) — Zig client with UDS support.
+
+Programmatic Go clients need no fork — set a custom dialer
+(`nats.SetCustomDialer`) that dials `unix`.
+
+# Original Upstream README
 
 <p align="center">
   <img src="logos/nats-horizontal-color.png" width="300" alt="NATS Logo">
